@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # agent-check: your own checks on any project, for the manager. Run it from the folder root.
 #   agent-check init       write a starter .agent-grid/checks.toml to fill in
-#   agent-check            run your check commands (and the levy rules, in a levy folder)
+#   agent-check            run your check commands, and any plugins' checks
 #   agent-check compare EXPECTED ACTUAL   compare an output with its known-good version
 # The manager runs these on every test, plus your golden tests (known inputs, known outputs).
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"

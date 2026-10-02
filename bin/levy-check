@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-# levy-check: your own checks on a levy roll, for the manager. Run it from the folder root.
-#   levy-check init       write a starter .agent-grid/checks.toml to fill in
-#   levy-check            check the roll the workflow wrote against your rules
-#   levy-check selftest   plant errors in copies of the rolls; see which checks catch them
-# The manager runs these on every test, plus a backtest against last year's certified roll.
-ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
-PY="$HOME/.venv/bin/python"; [ -x "$PY" ] || PY=python3
-exec "$PY" "$ROOT/lib/levy_check.py" "$@"

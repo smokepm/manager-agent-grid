@@ -32,8 +32,9 @@ fi
 [ $connected -eq 1 ] || { log "skipped: folder isn't connected to GitHub (run gh-connect)"; exit 0; }
 
 git add -u
-# Your checks and backtest files hold client results, so new ones stay local
-git ls-files -o --exclude-standard | grep -E "\.($EXT)$" | grep -vE '^\.agent-grid/(checks\.toml|backtest/)' \
+# Your checks and the files under .agent-grid/ hold your results, so new ones stay local;
+# only the analyst's workflows there are code
+git ls-files -o --exclude-standard | grep -E "\.($EXT)$" | awk '!/^\.agent-grid\// || /^\.agent-grid\/workflows\//' \
   | xargs -r -d '\n' git add --
 
 committed=0

@@ -91,6 +91,8 @@ WORKFLOW_TIMEOUT=${WORKFLOW_TIMEOUT:-900}
 TEST_TIMEOUT=${TEST_TIMEOUT:-2400}
 TEST_TOOLS="${TEST_TOOLS:-Read,Grep,Glob,Bash,Edit,Write}"
 CONTAIN=${CONTAIN:-1}
+ALLOW_UNCONTAINED=${ALLOW_UNCONTAINED:-0}
+SETUP_TOOLS_EXTRA="${SETUP_TOOLS_EXTRA:-}"
 EXCEL_WAIT=${EXCEL_WAIT:-3600}
 WORKFLOW_SANDBOX="${WORKFLOW_SANDBOX:-}"
 WORKFLOW_COPY_MAX_MB=${WORKFLOW_COPY_MAX_MB:-2000}
@@ -229,7 +231,7 @@ if ! jq empty "$S" 2>/dev/null; then
 else
   backup "$S"; tmp=$(mktemp)
   # One hook script for four events. Old agent-grid entries are replaced, others kept.
-  # PreToolUse keeps analysts from changing your checks or reading your spot checks.
+  # PreToolUse keeps analysts from changing your checks or reading your hidden checks.
   jq --arg cmd '$HOME/.local/bin/agent-hook' '
     def strip: map(select(([.hooks[]?.command] | any(test("auto-commit|agent-hook"))) | not));
     def entry(t): [{"hooks": [{"type": "command", "command": $cmd, "timeout": t}]}];

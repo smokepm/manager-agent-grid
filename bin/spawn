@@ -50,13 +50,11 @@
 #
 # The manager:
 #   --setup [DIR]        have Claude set up a folder's checks: it finds what "correct"
-#                        means from your tests, specs, and known-good outputs (in a levy
-#                        folder, the RMA and last year's certified roll), writes
+#                        means from your tests, specs, and known-good outputs, writes
 #                        checks.toml, and shows you where every check came from. spawn
 #                        offers this at launch for any folder without checks.
 #   --hidden [DIR]       your hidden checks for a folder: scripts kept outside it, so
 #                        analysts never see them; a failure comes to you, not the analyst
-#   --spot [DIR]         levy folders: your hand-calculated parcels, compared with the roll
 #   --test [DIR]         run the manager's test on a folder now, in the foreground
 #   --watch [DIR]        follow the manager's test of a folder live, and each one after
 #                        it (Ctrl+b W does this for the pane you're in)
@@ -199,23 +197,32 @@ doctor() {
     done
   fi
 
-  if [ "${CONTAIN:-1}" != 1 ]; then meh "manager containment is off (CONTAIN=0): test runs can write outside their copy"
-  elif ! command -v bwrap >/dev/null; then bad "bubblewrap is missing, so test runs can write outside their copy (sudo dnf install bubblewrap, or sudo apt install bubblewrap)"
+  local unc="the manager won't test (ALLOW_UNCONTAINED=1 runs workflows uncontained, with a read-only manager)"
+  if [ "${CONTAIN:-1}" != 1 ]; then
+    if [ "${ALLOW_UNCONTAINED:-0}" = 1 ]; then meh "containment is off (CONTAIN=0, ALLOW_UNCONTAINED=1): workflows run uncontained, and the manager can only read"
+    else bad "containment is off (CONTAIN=0), so $unc"; fi
+  elif ! command -v bwrap >/dev/null; then bad "bubblewrap is missing, so $unc. Install it: sudo dnf install bubblewrap, or sudo apt install bubblewrap"
   elif ! bwrap --ro-bind / / --dev /dev --proc /proc true >/dev/null 2>&1; then
-    bad "bubblewrap is installed but can't run here (on Ubuntu 24.04+: sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0, or set CONTAIN=0)"
+    bad "bubblewrap can't run here, so $unc. On Ubuntu 24.04+: sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0"
   else
     ok "manager containment (bubblewrap): test runs can only write inside their copy"
     if [ -n "$WSL_DISTRO_NAME" ]; then
       if bwrap --ro-bind / / --dev /dev --proc /proc /mnt/c/Windows/System32/cmd.exe /c exit >/dev/null 2>&1; then
         ok "Windows programs (winpy) run inside containment"
         meh "Windows programs are outside Linux containment: they can write anywhere on Windows. Keep workflow outputs inside the folder."
-      else bad "Windows programs don't start inside containment, so winpy workflows will fail. Set CONTAIN=0 to test them uncontained"; fi
+      else bad "Windows programs don't start inside containment, so winpy workflows will fail. CONTAIN=0 with ALLOW_UNCONTAINED=1 tests them uncontained, with a read-only manager"; fi
     fi
   fi
   local py="$HOME/.venv/bin/python"; [ -x "$py" ] || py=python3
-  if "$py" -c 'import tomllib, openpyxl' 2>/dev/null; then ok "agent-check and levy-check ($("$py" --version 2>&1), read .csv and .xlsx)"
-  elif "$py" -c 'import tomllib' 2>/dev/null; then meh "agent-check and levy-check can't read .xlsx files: $py -m pip install openpyxl"
-  else bad "agent-check and levy-check need Python 3.11+ ($("$py" --version 2>&1) found)"; fi
+  if "$py" -c 'import tomllib, openpyxl' 2>/dev/null; then ok "agent-check ($("$py" --version 2>&1), compares .xlsx outputs too)"
+  elif "$py" -c 'import tomllib' 2>/dev/null; then meh "agent-check can't compare .xlsx outputs: $py -m pip install openpyxl"
+  else bad "agent-check needs Python 3.11+ ($("$py" --version 2>&1) found)"; fi
+  local pl
+  for pl in "$CONF_DIR"/plugins/*/plugin; do
+    [ -e "$pl" ] || continue
+    if [ -x "$pl" ]; then ok "plugin: $(basename "$(dirname "$pl")") ($(short "$(readlink -f "$pl")"))"
+    else bad "plugin $(basename "$(dirname "$pl")") isn't executable: chmod +x $(short "$pl")"; fi
+  done
   if command -v flock >/dev/null; then ok "flock (Excel tests take turns)"
   else bad "flock is missing (util-linux)"; fi
 
@@ -257,9 +264,9 @@ doctor() {
 }
 
 # ---- Setting up a folder's checks ---------------------------------
-# The checks are the user's answer key, so the setup agent builds them from the data,
-# last year's certified results, and the RMA, never from the levy code, and ends with
-# a summary the user confirms.
+# The checks are the user's answer key, so the setup agent builds them from independent
+# sources (specs, the user's own tests, known-good outputs), never from the code, and
+# ends with a summary the user confirms.
 setup_prompt() {   # $1 = new | existing
   cat << 'P'
 Set up the agent-grid manager's checks for this folder, in .agent-grid/checks.toml.
@@ -304,9 +311,6 @@ P
 %s
 ' "$(basename "$f" .md)" "$(cat "$f")"
   done
-  [ -n "${LEVY_SOFTWARE:-}" ] && printf '
-%s
-' "The levy software here is ${LEVY_SOFTWARE}: certified rolls and levy exports come from it."
   [ "$1" = existing ] && printf '
 %s
 ' "There is already a .agent-grid/checks.toml. Review it against the data and documents, complete what's missing, and list every change you make. Don't loosen or remove a check without asking."
@@ -325,10 +329,15 @@ setup_checks() {   # $1 = folder
   # pane shows "setting up checks", then "checks ready: your turn" when its summary is up.
   # Auto memory is off: notes from setup would load into every later session here,
   # the analyst's included.
-  local pane="${TMUX_PANE:-}" rc
+  local pane="${TMUX_PANE:-}" rc p t ptools=""
+  # Plugins can pre-approve their own commands for setup (e.g. Bash(mytool:*))
+  for p in "$CONF_DIR"/plugins/*/plugin; do
+    [ -x "$p" ] || continue
+    while IFS= read -r t; do [ -n "$t" ] && ptools="$ptools,$t"; done < <("$p" tools 2>/dev/null)
+  done
   [ -n "$pane" ] && tmux set -p -t "$pane" @status setup 2>/dev/null && tmux set -p -t "$pane" @status_at "$(date +%H:%M)" 2>/dev/null
   ( cd "$dir" && AGENT_GRID_SETUP=1 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 claude "$(setup_prompt "$state")" --permission-mode acceptEdits \
-      --allowedTools "Read,Grep,Glob,Bash(agent-check:*),Bash(levy-check:*),Bash(python3:*),Bash($py:*),Bash(ls:*),Bash(find:*),Bash(head:*),Bash(cat:*),Bash(wc:*),Bash(file:*),Bash(cp:*),Bash(mkdir:*)" ); rc=$?
+      --allowedTools "Read,Grep,Glob,Bash(agent-check:*)${ptools}${SETUP_TOOLS_EXTRA:+,$SETUP_TOOLS_EXTRA},Bash(python3:*),Bash($py:*),Bash(ls:*),Bash(find:*),Bash(head:*),Bash(cat:*),Bash(wc:*),Bash(file:*),Bash(cp:*),Bash(mkdir:*)" ); rc=$?
   [ -n "$pane" ] && tmux set -pu -t "$pane" @status 2>/dev/null
   return $rc
 }
@@ -363,39 +372,6 @@ EOF
   "${EDITOR:-nano}" "$f"
 }
 
-# ---- Your hand-calculated parcels ----------------------------------
-# Kept under ~/.config/agent-grid/spot/, outside the folder, so analysts never see the
-# figures and can't tune the code to them. The hook blocks analysts from reading them.
-spot_edit() {   # $1 = folder
-  local dir key f
-  dir=$(cd "${1:-.}" 2>/dev/null && pwd -P) || die "No such folder: $1"
-  key=$(printf '%s' "$dir" | md5sum | cut -c1-12)
-  f="$CONF_DIR/spot/$key.toml"
-  mkdir -p "$CONF_DIR/spot" && chmod 700 "$CONF_DIR/spot"
-  if [ ! -f "$f" ]; then
-    cat > "$f" << EOF
-# Hand-calculated parcels for $(short "$dir")
-# Work a few parcels out yourself from the RMA, one per rate class (each developed class,
-# undeveloped land, anything unusual), and enter the levy you expect for each below.
-# This file lives outside the folder, and agent-grid blocks analysts from reading it.
-# On every test the manager compares the roll with these figures. A mismatch comes to
-# you, not the analyst: either the code or your figure is wrong. Update it every year.
-# (If you move or rename the folder, run spawn --spot there again: this file goes by path.)
-fiscal_year = ""
-tolerance = 0.00
-
-[parcels]
-# "123-456-789" = 1234.56    # Zone 7 single family: 1 unit x 1,234.56 (RMA section 4.2)
-EOF
-    chmod 600 "$f"
-  fi
-  echo "Hand-calculated parcels for $(basename "$dir"): $(short "$f")"
-  "${EDITOR:-nano}" "$f"
-  if [ -f "$dir/.agent-grid/checks.toml" ]; then
-    echo; echo "Against the roll there now:"
-    ( cd "$dir" && "$ROOT/bin/levy-check" spot "$f" ) || true
-  fi
-}
 
 # ---- Watching the manager -----------------------------------------
 # Each review is a fresh Claude that streams what it does to a live log per folder.
@@ -495,7 +471,7 @@ overview() {
   if [ -n "$TMUX" ]; then tmux switch-client -t "$id"; else tmux select-window -t "$id"; tmux select-pane -t "$id"; tmux attach -t "$id"; fi
 }
 
-# The folders on screen, as the hook's log writes them ("~/levies/oak-hills")
+# The folders on screen, as the hook's log writes them ("~/projects/reports")
 agent_folders() {
   local p q
   tmux list-panes -a -f '#{@agent}' -F '#{pane_current_path}' 2>/dev/null | sort -u | while IFS= read -r p; do
@@ -626,8 +602,6 @@ for ((i = 0; i < ${#argv[@]}; i++)); do
     --clean)     exec "$ROOT/bin/agent-hook" --clean ;;
     --setup)     nxt="${argv[$((i + 1))]:-.}"; [[ "$nxt" == -* ]] && nxt=.
                  setup_checks "$nxt"; exit $? ;;
-    --spot)      nxt="${argv[$((i + 1))]:-.}"; [[ "$nxt" == -* ]] && nxt=.
-                 spot_edit "$nxt"; exit $? ;;
     --hidden)    nxt="${argv[$((i + 1))]:-.}"; [[ "$nxt" == -* ]] && nxt=.
                  hidden_edit "$nxt"; exit $? ;;
     --watch)     nxt="${argv[$((i + 1))]:-}"; [[ "$nxt" == -* ]] && nxt=""

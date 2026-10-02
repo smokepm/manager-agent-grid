@@ -3,16 +3,19 @@
 Reads .agent-grid/checks.toml in the current folder (the folder root):
 
   protect = ["tests/", "SPEC.md"]       files analysts can read but never change
+  outputs = ["out/report.csv"]          files the workflows write that your checks read
+                                        (removed before each run, so stale ones can't pass)
   [[check]]  name, run, timeout         commands that must pass (exit 0)
   [[golden]] name, workflow, inputs,    known inputs with known-good outputs: the
              expect, compare            workflow runs on the inputs, and each output
                                         must match its expected file
-Levy folders also use [roll], [rules], [backtest] and the rest: see levy-check.
+Plugins (~/.config/agent-grid/plugins/<name>/plugin) can add their own checks for a kind of
+project; "agent-check" runs those too.
 
 Commands:
   agent-check init                    write a starter checks.toml to fill in
-  agent-check run                     run every [[check]] here (and levy-check's rules, in a
-                                      levy folder); the manager uses it after changing inputs
+  agent-check run                     run every [[check]] here, and any plugins' checks; the
+                                      manager uses it after changing inputs
   agent-check compare EXPECTED ACTUAL compare two files; exit 0 if they match
   agent-check plan                    (used by agent-hook) the checks and golden tests, as JSON
   agent-check protect                 (used by agent-hook) the protected paths, one per line
@@ -21,6 +24,7 @@ Exit codes: 0 all passed, 1 a check failed, 2 checks.toml or a file it names can
 """
 import difflib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -31,7 +35,8 @@ except ImportError:  # Python < 3.11
     tomllib = None
 
 CONFIG = Path(".agent-grid/checks.toml")
-ALWAYS = [".agent-grid/checks.toml", ".agent-grid/review.md", ".agent-grid/backtest/", ".agent-grid/golden/"]
+ALWAYS = [".agent-grid/checks.toml", ".agent-grid/review.md", ".agent-grid/golden/"]
+PLUGINS = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "agent-grid" / "plugins"
 SHOW = 40
 
 TEMPLATE = """# Your answer key for this folder: what "correct" means, from sources other than the
@@ -39,8 +44,12 @@ TEMPLATE = """# Your answer key for this folder: what "correct" means, from sour
 # but never change it: agent-grid blocks their edits. Paths are relative to the folder root.
 
 # Files and folders analysts can read but never change: your own tests, fixtures, specs.
-# (This file, .agent-grid/golden/, .agent-grid/backtest/, and review.md always are.)
+# (This file, .agent-grid/golden/, and review.md always are.)
 protect = []                    # e.g. ["tests/", "fixtures/", "SPEC.md"]
+
+# Files the workflows write that your checks read. They're deleted before each test run,
+# so a workflow that stops writing one fails instead of passing on an old copy.
+outputs = []                    # e.g. ["out/report.csv"]
 
 # Commands that must pass, run from the folder root in the test copy, after the workflows.
 # Exit 0 means pass. Use tests you wrote or trust, not ones the analyst wrote.
@@ -132,8 +141,8 @@ def plan(cfg):
             raise Unusable(f"golden {name!r} names no workflow, but there are {len(wfs)} ({', '.join(wfs)}). Name one.")
         goldens.append({"name": name, "workflow": wf or (wfs[0] if wfs else ""), "inputs": inputs,
                         "expect": expect, "compare": compare})
-    return {"protect": protected(cfg), "levy": isinstance(cfg.get("roll"), dict),
-            "checks": checks, "golden": goldens}
+    outputs = [inside(o, "outputs entry") for o in (cfg.get("outputs") or [])]
+    return {"protect": protected(cfg), "outputs": outputs, "checks": checks, "golden": goldens}
 
 
 # ---- Comparing an output with its known-good version ---------------
@@ -202,8 +211,7 @@ def cmd_run():
     cfg = load_config()
     p = plan(cfg)
     failed = False
-    if not p["checks"] and not p["levy"]:
-        print("agent-check: checks.toml has no [[check]] commands to run")
+    ran = 0
     for c in p["checks"]:
         try:
             r = subprocess.run(c["run"], shell=True, capture_output=True, text=True, timeout=c["timeout"],
@@ -211,6 +219,7 @@ def cmd_run():
             rc, out = r.returncode, (r.stdout + r.stderr).strip().splitlines()
         except subprocess.TimeoutExpired:
             rc, out = 124, [f"(stopped: ran longer than {c['timeout']} seconds)"]
+        ran += 1
         if rc == 0:
             print(f"pass {c['name']}")
         else:
@@ -218,13 +227,22 @@ def cmd_run():
             print(f"FAIL {c['name']} (exit {rc}): {c['run']}")
             for ln in out[-25:]:
                 print(f"  {ln}")
-    if p["levy"]:
-        lc = Path(__file__).with_name("levy_check.py")
-        r = subprocess.run([sys.executable, str(lc), "rules"], capture_output=True, text=True)
-        print(r.stdout.rstrip())
+    # Plugins' checks: exit 0 pass, 1 fail, 2 can't be used, 3 doesn't apply here
+    env = dict(os.environ, AGENT_GRID_DIR=os.getcwd(), AGENT_GRID_NESTED="1")
+    for plug in sorted(PLUGINS.glob("*/plugin")):
+        if not os.access(plug, os.X_OK):
+            continue
+        r = subprocess.run([str(plug), "check"], capture_output=True, text=True, env=env)
+        if r.returncode == 3:
+            continue
+        ran += 1
+        print(f"-- {plug.parent.name} checks:")
+        print((r.stdout + r.stderr).rstrip())
         if r.returncode == 2:
-            raise Unusable(r.stdout.strip().splitlines()[-1] if r.stdout.strip() else "levy-check failed")
+            raise Unusable(f"the {plug.parent.name} plugin's checks can't be used (see above)")
         failed = failed or r.returncode != 0
+    if not ran:
+        print("agent-check: checks.toml has no [[check]] commands to run")
     return 1 if failed else 0
 
 
