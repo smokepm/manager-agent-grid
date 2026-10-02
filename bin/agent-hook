@@ -1,0 +1,902 @@
+#!/usr/bin/env bash
+# agent-hook: Claude Code hook for agent-grid (UserPromptSubmit, Notification, Stop,
+# PreToolUse), and the manager's test engine.
+#
+# Hook events:
+#   - marks the tmux pane: setting up checks / checks ready for you / working / needs you /
+#     checking / manager testing / queued for Excel / done / checks failed / manager flagged
+#   - PreToolUse, in analyst sessions: blocks edits to your checks, backtest, and review.md,
+#     and any look at your hand-calculated parcels (spawn --spot)
+#   - desktop notification when an agent finishes or needs you (NOTIFY=0 turns it off)
+#   - Stop, step 1: .agent-grid/verify.sh; failures go back to Claude (VERIFY_MAX times)
+#   - Stop, step 2: the manager. Code changes need a workflow
+#     (.agent-grid/workflows/<name>/run.sh + WORKFLOW.md). In a contained copy of the
+#     folder, it runs every workflow, then your checks (.agent-grid/checks.toml, via
+#     levy-check) and a backtest: last year's inputs through the new code must reproduce
+#     last year's certified roll. Anything that fails goes straight back. Then a second
+#     Claude tries to refute or break the work. The analyst waits for the verdict, and
+#     problems go straight back to it.
+#   - Stop, step 3: auto-push in `spawn --gh` sessions, only after checks and the manager pass
+#   - Setup sessions (spawn --setup) only update the pane's status; they're never reviewed
+# The hook prints nothing, except a block decision when something fails, and a short
+# briefing at the start of a managed session.
+#
+# Command line (used by spawn):
+#   agent-hook --test DIR               test a folder now, in the foreground; prints the result
+#   agent-hook --clean                  delete every test copy
+
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/agent-grid/config"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/agent-grid"
+LOG="$STATE/agent-hook.log"
+SPOT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/agent-grid/spot"   # your hand-calculated parcels
+EXT="${CODE_EXT:-py|md|toml|ts|tsx|js|jsx|sh|sql|r|R|go|rs}"
+CODE_ONLY=$(printf '%s' "$EXT" | tr '|' '\n' | grep -vx md | paste -sd'|' -)   # md alone needs no workflow
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+LEVY_CHECK="$(dirname "$SELF")/levy-check"
+TILDE='~'
+mkdir -p "$STATE/reviews"; chmod 700 "$STATE" 2>/dev/null
+
+CODE_INC=(); for e in ${CODE_ONLY//|/ } json yaml yml ini cfg bat ps1; do CODE_INC+=(--include="*.$e"); done
+SKIP_DIRS=(--exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.venv --exclude-dir=venv
+           --exclude-dir=__pycache__ --exclude-dir=worktrees)
+
+# ---- Folder and pane --------------------------------------------
+DIR=""; KEY=""; AG=""; WFDIR=""; SROOT=""; pane=""; name=""; session=""
+setup_dir() {
+  DIR=$(cd "$1" 2>/dev/null && pwd -P) || DIR="$1"
+  KEY=$(printf '%s' "$DIR" | md5sum | cut -c1-12)
+  AG="$DIR/.agent-grid"; WFDIR="$AG/workflows"
+  SROOT="${WORKFLOW_SANDBOX:-}"
+  if [ -z "$SROOT" ]; then
+    # Windows Excel (winpy) can't reliably open files inside the Linux filesystem,
+    # so a folder on a Windows drive gets its test copies on the Windows side too.
+    case "$DIR" in /mnt/[a-z]/*) [ -n "${WIN_HOME:-}" ] && SROOT="$WIN_HOME/AppData/Local/Temp/agent-grid" ;; esac
+  fi
+  SROOT="${SROOT:-${TMPDIR:-/tmp}/agent-grid-$(id -u)}"
+}
+base_slug() { basename "$DIR" | tr ' /' '__'; }
+
+find_pane() {
+  [ -n "$pane" ] && return 0
+  command -v tmux >/dev/null || return 0
+  local matches
+  matches=$(tmux list-panes -a -f '#{@agent}' -F "#{pane_id}	#{pane_current_path}" 2>/dev/null \
+            | awk -F '\t' -v d="$DIR" '$2 == d { print $1 }')
+  [ "$(printf '%s\n' "$matches" | grep -c .)" = 1 ] && pane="$matches"
+  return 0
+}
+set_status() {
+  [ -n "$pane" ] || return 0
+  tmux set -p -t "$pane" @status "$1" 2>/dev/null
+  tmux set -p -t "$pane" @status_at "$(date +%H:%M)" 2>/dev/null
+  return 0
+}
+get_status() { [ -n "$pane" ] && tmux show -pqv -t "$pane" @status 2>/dev/null; }
+pane_name() {
+  [ -n "$pane" ] && name=$(tmux display -p -t "$pane" '#{?@label,#{@label},#{b:pane_current_path}}' 2>/dev/null)
+  name="${name:-$(basename "$DIR")}"
+}
+looking() {
+  [ -n "$pane" ] || return 1
+  [ "$(tmux display -p -t "$pane" '#{&&:#{pane_active},#{&&:#{window_active},#{session_attached}}}' 2>/dev/null)" = 1 ]
+}
+
+log() {
+  printf '%s  %s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${DIR/#$HOME/$TILDE}" "$*" >> "$LOG"
+  if [ "$(wc -l < "$LOG")" -gt 1000 ]; then tail -n 500 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"; fi
+}
+
+notify() {  # $1 title, $2 body
+  [ "${NOTIFY:-1}" = 1 ] || return 0
+  local ps=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
+  if [ -n "$WSL_DISTRO_NAME" ] && [ -x "$ps" ]; then
+    local t="${1//\'/\'\'}" b="${2//\'/\'\'}"
+    ( cd /mnt/c && "$ps" -NoProfile -NonInteractive -Command "
+      [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > \$null;
+      \$x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);
+      \$n = \$x.GetElementsByTagName('text');
+      \$n.Item(0).AppendChild(\$x.CreateTextNode('$t')) > \$null;
+      \$n.Item(1).AppendChild(\$x.CreateTextNode('$b')) > \$null;
+      [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new(\$x))
+    " >/dev/null 2>&1 & )
+  elif command -v notify-send >/dev/null; then
+    ( notify-send -a agent-grid "$1" "$2" >/dev/null 2>&1 & )
+  fi
+  [ -n "$pane" ] && tmux display-message -d 4000 "agent-grid: $1" 2>/dev/null
+  return 0
+}
+
+auto_push() {
+  [ -x "$HOME/.local/bin/auto-commit" ] || return 0
+  CLAUDE_PROJECT_DIR="$DIR" "$HOME/.local/bin/auto-commit" >/dev/null 2>&1 || true
+}
+
+block() { jq -n --arg r "$1" '{decision: "block", reason: $r}'; }
+
+# Retry counts per folder
+bump() { local f="$STATE/$1-$KEY.tries" n; n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$f"; echo "$n"; }
+reset_tries() { rm -f "$STATE/$1-$KEY.tries"; }
+
+# Any files changed (outside .git and .agent-grid) since a stamp file?
+changed_since() {
+  [ -f "$1" ] || return 0
+  [ -n "$(find "$DIR" -type f -newer "$1" -not -path '*/.git/*' -not -path '*/.agent-grid/*' -print -quit 2>/dev/null)" ]
+}
+
+# Seconds left before Claude's own Stop-hook limit (the installer sets 7200)
+remaining() { echo $(( ${HOOK_BUDGET:-7000} - SECONDS )); }
+cap() { local r; r=$(remaining); [ "$1" -lt "$r" ] && echo "$1" || echo "$(( r > 60 ? r - 30 : 30 ))"; }
+
+# ---- Step 1: deterministic checks --------------------------------
+run_verify() {   # returns 0 = ok/none, 1 = blocked (already printed), 2 = gave up
+  local vf="$AG/verify.sh" stamp="$STATE/verify-$KEY.stamp" out rc n max
+  [ -f "$vf" ] || vf="$AG/verify"
+  [ -f "$vf" ] || return 0
+  changed_since "$stamp" || return 0
+
+  set_status checking
+  out=$(cd "$DIR" && AGENT_GRID_NESTED=1 timeout "${VERIFY_TIMEOUT:-600}" bash "$vf" 2>&1); rc=$?
+  if [ $rc -eq 0 ]; then
+    touch "$stamp"; reset_tries verify; log "verify: passed"; return 0
+  fi
+  max="${VERIFY_MAX:-3}"; n=$(bump verify)
+  if [ "$n" -le "$max" ]; then
+    log "verify: failed (attempt $n of $max), sent back to the analyst"
+    set_status working
+    block "$(printf 'agent-grid: the checks in %s failed (attempt %s of %s). Find and fix the cause, then finish. Do not edit the check to make it pass. Last output:\n%s' \
+             ".agent-grid/$(basename "$vf")" "$n" "$max" "$(printf '%s\n' "$out" | tail -n 40)")"
+    return 1
+  fi
+  reset_tries verify
+  log "verify: failed $max times, handed back to you"
+  set_status failed
+  notify "$name: checks failed" "Verification failed $max times in a row. Take a look."
+  return 2
+}
+
+# ---- Your files -------------------------------------------------
+# checks.toml (your rules and the backtest), backtest/ (last year's inputs and certified
+# roll), and review.md belong to you. The analyst never edits them; if they change
+# between tests, the result says so and you're notified.
+user_files() {   # $1 = folder (default DIR); relative paths, sorted
+  ( cd "${1:-$DIR}" 2>/dev/null || exit 0
+    for f in .agent-grid/checks.toml .agent-grid/review.md; do [ -f "$f" ] && echo "$f"; done
+    find .agent-grid/backtest -type f 2>/dev/null ) | sort
+}
+user_hash() {
+  local l; l=$(user_files "${1:-$DIR}")
+  [ -n "$l" ] || { echo none; return; }
+  ( cd "${1:-$DIR}" && printf '%s\n' "$l" | while IFS= read -r f; do sha256sum "$f"; done ) | sha256sum | cut -c1-64
+}
+
+# ---- What changed ------------------------------------------------
+is_git() { git -C "$DIR" rev-parse --verify -q HEAD >/dev/null 2>&1; }
+git_base() {
+  local base; base=$(cat "$STATE/review-$KEY.sha" 2>/dev/null)
+  git -C "$DIR" cat-file -e "${base:-none}^{commit}" 2>/dev/null || base=HEAD
+  printf '%s' "$base"
+}
+changed_files() {   # relative to DIR, since the last passing review (or the session's start)
+  local stamp="$STATE/review-$KEY.stamp" f
+  if is_git; then
+    { git -C "$DIR" diff --name-only "$(git_base)" -- . 2>/dev/null
+      git -C "$DIR" ls-files -o --exclude-standard 2>/dev/null; } | sort -u | while IFS= read -r f; do
+        # Your own uncommitted edits from before the starting point aren't the analyst's
+        if [ ! -f "$stamp" ] || [ ! -e "$DIR/$f" ] || [ "$DIR/$f" -nt "$stamp" ]; then printf '%s\n' "$f"; fi
+      done
+  elif [ -f "$stamp" ]; then
+    find "$DIR" -type f -newer "$STATE/review-$KEY.stamp" -not -path '*/.git/*' 2>/dev/null | sed "s|^$DIR/||"
+  else
+    find "$DIR" -type f -mmin -120 -not -path '*/.git/*' 2>/dev/null | sed "s|^$DIR/||"
+  fi
+}
+collect_changes() {   # what changed, as text for the manager
+  local f
+  if is_git; then
+    local base; base=$(git_base)
+    git -C "$DIR" diff --stat "$base" -- . ':!.agent-grid' 2>/dev/null
+    echo
+    git -C "$DIR" diff "$base" -- . ':!.agent-grid' ':!*.xlsx' ':!*.xlsm' ':!*.xls' ':!*.csv' ':!*.pdf' ':!*.docx' 2>/dev/null
+    git -C "$DIR" ls-files -o --exclude-standard 2>/dev/null | grep -v '^\.agent-grid/' | grep -E "\.($EXT)$" | head -n 20 | while IFS= read -r f; do
+      printf '\n=== new file: %s ===\n' "$f"; head -c 20000 "$DIR/$f"
+    done
+  else
+    local list; list=$(changed_files | grep -v '^\.agent-grid/')
+    [ -n "$list" ] || return 0
+    echo "This folder isn't a git repo, so there's no diff. Files changed recently (read the relevant ones):"
+    printf '%s\n' "$list" | head -n 50
+  fi
+}
+list_workflows() {   # $1 = folder (default DIR)
+  local d
+  for d in "${1:-$DIR}"/.agent-grid/workflows/*/; do [ -d "$d" ] && basename "$d"; done 2>/dev/null
+}
+needs_test() {   # anything new since the last passing test?
+  local files
+  # Your files or a workflow changed
+  [ "$(user_hash)" != "$(cat "$STATE/user-$KEY.sha" 2>/dev/null)" ] && [ -d "$WFDIR" ] && return 0
+  if [ -d "$WFDIR" ] && { [ ! -f "$STATE/review-$KEY.stamp" ] || \
+       [ -n "$(find "$WFDIR" -type f -newer "$STATE/review-$KEY.stamp" -print -quit 2>/dev/null)" ]; }; then return 0; fi
+  [ -f "$STATE/review-$KEY.stamp" ] && ! changed_since "$STATE/review-$KEY.stamp" && return 1
+  files=$(changed_files)
+  [ -n "$files" ] && return 0
+  # New data files (often gitignored) count once a folder has workflows
+  [ -d "$WFDIR" ] && [ -f "$STATE/review-$KEY.stamp" ]
+}
+
+# ---- Workflow checks (cheap, before anything runs) ---------------
+WORKFLOW_HELP='Write one workflow for each process the code runs (for example one per levy run):
+
+.agent-grid/workflows/<name>/run.sh
+  The exact commands that produce the outputs. It runs from the folder root, in a
+  copy of this folder, so use paths relative to the folder root. Exit non-zero if
+  any step fails. Name the folder with letters, digits, dot, dash, or underscore.
+  If .agent-grid/checks.toml exists, the workflow must write the roll it names
+  ([roll] file), at that path and with those column names.
+
+.agent-grid/workflows/<name>/WORKFLOW.md, with these sections:
+  ## Purpose          what the run produces
+  ## Inputs           each input file and what is in it
+  ## Outputs          each output file run.sh writes (inside this folder)
+  ## Correct means    checks someone could verify against the outputs, e.g.
+                      every parcel in the input appears exactly once in the output;
+                      no charge exceeds the maximum rate; total levy ties to the budget
+  ## Edge cases       cases the code is meant to handle, and inputs that are out of scope
+
+Never edit .agent-grid/checks.toml, .agent-grid/backtest/, or .agent-grid/review.md.
+They belong to the user: the rules and last year'"'"'s certified results the manager
+tests against, and agent-grid blocks edits to them. If a check looks wrong (for example
+it would make you bill above a maximum, or repeat an amount you believe was a mistake),
+stop and say so in your reply. Do not change the code to fit it, and never special-case
+particular parcels to make a check pass.'
+
+check_workflows() {   # $@ = workflow names; prints problems, empty if fine
+  local wf pats=(-e "$DIR") e
+  for wf in "$@"; do
+    [[ "$wf" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "- \"$wf\": rename it using only letters, digits, dot, dash, or underscore"; continue; }
+    [ -f "$WFDIR/$wf/run.sh" ]      || echo "- $wf: missing run.sh"
+    [ -f "$WFDIR/$wf/WORKFLOW.md" ] || echo "- $wf: missing WORKFLOW.md"
+    if [ -f "$WFDIR/$wf/WORKFLOW.md" ] && ! grep -qiE '^#+ *correct' "$WFDIR/$wf/WORKFLOW.md"; then
+      echo "- $wf: WORKFLOW.md has no \"Correct means\" section, so there is nothing to test the outputs against"
+    fi
+  done
+  # The folder's own full path would make a test in a copy touch the real files
+  command -v wslpath >/dev/null && e=$(wslpath -w "$DIR" 2>/dev/null) && [ -n "$e" ] && pats+=(-e "$e")
+  { grep -rliF "${pats[@]}" "${SKIP_DIRS[@]}" "${CODE_INC[@]}" --exclude-dir=.agent-grid "$DIR" 2>/dev/null
+    grep -rliF "${pats[@]}" "$WFDIR" --exclude='*.md' 2>/dev/null; } \
+    | sed "s|^$DIR/||" | sort -u | head -n 10 | sed 's/^/- uses the folder'"'"'s full path (use a path relative to the folder root): /'
+}
+
+flag_workflow_problem() {   # $1 message, $2 short reason for the log; returns 1 (blocked) or 2 (gave up)
+  local n max="${REVIEW_MAX:-2}" sent="$STATE/wfsent-$KEY" reply
+  # Sent back, and the analyst stopped again without changing anything: asking a second
+  # time won't help, so it's yours now, with the analyst's reply
+  if [ -f "$sent" ] && [ -z "$(find "$DIR" -type f -newer "$sent" -not -path '*/.git/*' -print -quit 2>/dev/null)" ]; then
+    rm -f "$sent"; reset_tries workflow
+    reply=$(jget .last_assistant_message | tr '\n' ' ' | cut -c1-200)
+    log "manager: the analyst stopped without changing anything after being asked for a workflow, so it's handed to you${reply:+. Its reply: $reply}"
+    set_status flagged
+    notify "$name: needs you" "The analyst didn't write a workflow when asked. Read its reply in the pane."
+    return 2
+  fi
+  n=$(bump workflow)
+  if [ "$n" -le "$max" ]; then
+    touch "$sent"
+    log "manager: workflow problem (round $n of $max), sent back to the analyst${2:+: $2}"
+    set_status working
+    block "$(printf 'agent-grid (manager, round %s of %s): %s\n\n%s\n\nThen finish your turn again.' "$n" "$max" "$1" "$WORKFLOW_HELP")"
+    return 1
+  fi
+  reset_tries workflow; rm -f "$sent"
+  log "manager: workflow problem not fixed after $max rounds, handed back to you${2:+: $2}"
+  set_status flagged
+  notify "$name: manager flagged" "The workflows still can't be tested after $max rounds. Take a look."
+  return 2
+}
+
+# ---- Contained test copies ---------------------------------------
+# Every run happens in a copy. With bubblewrap, the copy is the only place under the
+# folder's parent (and /mnt) that can be written; $HOME stays writable for Claude itself.
+can_contain() {
+  [ "${CONTAIN:-1}" = 1 ] && command -v bwrap >/dev/null && \
+    bwrap --ro-bind / / --dev /dev --proc /proc true >/dev/null 2>&1
+}
+contain() {   # run "$@" contained, if bubblewrap works here
+  if [ "$CONTAINED" != 1 ]; then "$@"; return; fi
+  local prot a=(--ro-bind / / --dev /dev --proc /proc --die-with-parent)
+  prot=$(dirname "$DIR"); { [ "$prot" = "$HOME" ] || [ "$prot" = / ]; } && prot="$DIR"
+  a+=(--bind "$HOME" "$HOME" --bind /tmp /tmp)
+  [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ] && a+=(--bind "$TMPDIR" "$TMPDIR")
+  a+=(--ro-bind "$prot" "$prot" --ro-bind "$STATE" "$STATE" --bind "$SROOT" "$SROOT")
+  bwrap "${a[@]}" "$@"
+}
+CONTAINED=0
+
+RUN=""; SNAP=""
+make_snapshot() {   # sets RUN (this test's folder) and SNAP (pristine copy); 0 ok, 1 error, 3 too big
+  local mb
+  mkdir -p "$SROOT" && chmod 700 "$SROOT" 2>/dev/null
+  [ -d "$SROOT" ] || return 1
+  mb=$(du -sm --exclude=.git --exclude=node_modules --exclude=.venv "$DIR" 2>/dev/null | cut -f1)
+  [ "${mb:-0}" -le "${WORKFLOW_COPY_MAX_MB:-2000}" ] || return 3
+  RUN=$(mktemp -d "$SROOT/$(base_slug)-XXXXXX") || return 1
+  SNAP="$RUN/snapshot"; mkdir -p "$SNAP"
+  touch "$RUN/.started"
+  is_git && git -C "$DIR" rev-parse -q --verify HEAD > "$RUN/.head" 2>/dev/null
+  user_hash > "$RUN/.user"
+  tar -C "$DIR" --exclude=.git --exclude=node_modules --exclude=.venv --exclude=__pycache__ \
+      --exclude=./.claude/worktrees -cf - . 2>/dev/null | tar -C "$SNAP" -xf - 2>/dev/null \
+    || { rm -rf "$RUN"; RUN=""; return 1; }
+}
+clone() {   # $1 = new folder; a fresh copy of the snapshot
+  rm -rf "$1"; mkdir -p "$1" && cp -a --reflink=auto "$SNAP/." "$1/" 2>/dev/null || cp -a "$SNAP/." "$1/"
+}
+finish_run() {   # $1 = keep (on failure) or empty
+  [ -n "$RUN" ] && [ -d "$RUN" ] || return 0
+  if [ "$1" = keep ] && [ "${WORKFLOW_KEEP_FAILED:-1}" = 1 ]; then
+    local last; last="$SROOT/$(base_slug)-last-failed"
+    rm -rf "$last"; mv "$RUN" "$last" && RUN="$last"; touch "$RUN"
+  else
+    rm -rf "$RUN"; RUN=""
+    [ "$1" = pass ] && rm -rf "$SROOT/$(base_slug)-last-failed"
+  fi
+}
+prune() {   # test copies and saved reviews hold client data; don't keep them forever
+  local days="${WORKFLOW_KEEP_DAYS:-3}"
+  [ -d "$SROOT" ] && find "$SROOT" -mindepth 1 -maxdepth 1 -type d -mtime +"$days" -exec rm -rf {} + 2>/dev/null
+  find "$STATE/reviews" -type f -mtime +"${REVIEW_KEEP_DAYS:-30}" -delete 2>/dev/null
+  find "$STATE" -maxdepth 1 \( -name 'live-*.log' -o -name 'rounds-*.md' \) -mtime +"${REVIEW_KEEP_DAYS:-30}" -delete 2>/dev/null
+  return 0
+}
+
+uses_excel() {   # $1 = folder; Excel automation can't run two at once
+  grep -rqiE 'winpy|win32com|xlwings' "${SKIP_DIRS[@]}" "${CODE_INC[@]}" "$1" 2>/dev/null || \
+    grep -rqiE 'winpy|win32com|xlwings' "$1/.agent-grid/workflows" 2>/dev/null
+}
+
+# ---- The manager's instructions ----------------------------------
+READ_PROMPT='You are the manager of an analyst agent. The analyst just finished changing the files in this folder; the changes are below. Your job is to try to break their work before anyone relies on it. Look for anything that would make the results wrong: logic errors, wrong formulas or business rules, unhandled edge cases, records silently dropped or double counted, rounding, and anything that contradicts this folder'"'"'s CLAUDE.md or README. Read whatever files you need, and think of concrete inputs that would break it.
+
+Do not comment on style, naming, or optional improvements. Do not report problems you are unsure are real.
+
+For each real problem: the file, what is wrong, and a concrete example that breaks it. The last line of your answer must be exactly "VERDICT: PASS" if you found no real problems, or "VERDICT: FAIL" if you did.'
+
+TEST_PROMPT='You are the manager of an analyst agent. The analyst changed the code in this folder and wrote workflows that run it. You are in a disposable copy of the folder: run anything, change any file, create test inputs. Nothing you do here touches the real files. Stay inside this copy, and do not write to any path outside it.
+
+Your job is to test every workflow and try to break it before anyone relies on the results.
+
+The user'"'"'s own checks have already been run on this copy, and passed; the results are below. They come from .agent-grid/checks.toml and .agent-grid/backtest/, which the user wrote, not the analyst: rules every roll must meet, and a backtest showing that last year'"'"'s inputs through this code reproduce last year'"'"'s certified roll. They outrank WORKFLOW.md, the code, and anything else the analyst wrote, and they are your strongest tool: after you change inputs and rerun a workflow, run levy-check in the folder root to apply the user'"'"'s rules to the new outputs. A rule failure on any input you create is a real problem, unless WORKFLOW.md says that input is out of scope.
+
+Each workflow is in .agent-grid/workflows/<name>/: run.sh runs it, WORKFLOW.md describes it. Every run.sh has already been run once, as written, in this copy; the results are below.
+
+For each workflow:
+1. Check the outputs against "Correct means" in WORKFLOW.md and anything in the folder instructions the checks don'"'"'t cover. Verify by computing (for example a short Python script that re-totals a column, counts records, or compares rows), not by reading the code. Give the expected and actual values for every mismatch.
+2. Look for what the checks and backtest can'"'"'t see: anything new this year (a new zone, a rate change, an escalator, annexed or split parcels), and rules in the code that the checks don'"'"'t test.
+3. Try to break it: duplicate records, blank and missing values, zero and negative amounts, values exactly at and just over any limit, an extra or a missing column, records that should be excluded. Judge the results with levy-check first, then WORKFLOW.md. Run it twice on the same inputs and confirm the results do not change.
+4. Read the changed code for wrong formulas or business rules, rounding, and anything that contradicts the folder instructions.
+5. Outputs must be written inside this folder. Code that writes anywhere else is a problem.
+
+If the user has no checks or no backtest yet, test all the harder: you are the only check.
+
+Stopping with a clear error on bad input is fine. A wrong result without an error, on any input, is a problem. Input that WORKFLOW.md says is out of scope is not. Do not comment on style, and do not report anything you are not sure of.
+
+For each problem: the workflow, the file, what is wrong, and the expected and actual values or the exact input that shows it.
+Then one line per workflow, exactly "WORKFLOW <name>: PASS" or "WORKFLOW <name>: FAIL".
+The last line must be exactly "VERDICT: PASS" if you found no real problems, or "VERDICT: FAIL" if you did.'
+
+
+claude_bin() { command -v claude || echo "$HOME/.local/bin/claude"; }
+folder_rules() { [ -f "$AG/review.md" ] && printf '\n\nInstructions for this folder (from the user):\n%s' "$(cat "$AG/review.md")"; }
+review_file() { echo "$STATE/reviews/$(base_slug)-$(date +%Y%m%d-%H%M%S)-$$.md"; }
+record() {   # $1 workflow, $2 result: one line for the manager pane
+  printf '%s\t%s\t%s\t%s\n' "$(date '+%m-%d %H:%M')" "$name" "$1" "$2" >> "$STATE/workflow-results.tsv"
+  if [ "$(wc -l < "$STATE/workflow-results.tsv")" -gt 400 ]; then
+    tail -n 200 "$STATE/workflow-results.tsv" > "$STATE/workflow-results.tmp" && mv "$STATE/workflow-results.tmp" "$STATE/workflow-results.tsv"
+  fi
+}
+
+# ---- Round memory ------------------------------------------------
+# Each review is a fresh Claude, so it sees only the work, not the analyst's reasoning.
+# What carries over is a written record: earlier findings and the analyst's replies.
+ROUNDS() { echo "$STATE/rounds-$KEY.md"; }
+record_round() {   # $1 = findings sent to the analyst
+  local n; n=$(grep -c '^## Round ' "$(ROUNDS)" 2>/dev/null); n=$(( ${n:-0} + 1 ))
+  printf '## Round %s (%s): findings sent to the analyst\n%s\n\n' "$n" "$(date '+%m-%d %H:%M')" \
+    "$(printf '%s' "$1" | head -c 5000)" >> "$(ROUNDS)"
+}
+await_reply() { touch "$STATE/awaiting-$KEY"; }
+capture_reply() {   # at Stop: the analyst's answer to the findings it was given
+  [ -f "$STATE/awaiting-$KEY" ] || return 0
+  local msg tp
+  msg=$(jget .last_assistant_message)
+  if [ -z "$msg" ]; then
+    tp=$(jget .transcript_path)
+    [ -f "$tp" ] && msg=$(tail -n 300 "$tp" | jq -Rr 'fromjson? | select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text' 2>/dev/null)
+  fi
+  msg=$(printf '%s' "$msg" | tail -c 4000)
+  [ -n "$msg" ] && printf "## The analyst's reply\n%s\n\n" "$msg" >> "$(ROUNDS)"
+  rm -f "$STATE/awaiting-$KEY"
+}
+clear_rounds() { rm -f "$(ROUNDS)" "$STATE/awaiting-$KEY"; }
+
+HISTORY_PROMPT='This is not the first round. Below are the findings from earlier rounds and the analyst'"'"'s replies. For each earlier finding: check whether it is actually fixed now, by rerunning the input that showed it, and say so in one line. If it is not fixed, report it again. If the analyst disputed it, weigh their argument: report it again only if you can answer that argument with new evidence; otherwise drop it and say why in one line. Do not repeat findings that are fixed. Then test everything else as usual; earlier rounds are not the limit of what to look for.'
+
+# ---- Live log, for spawn --watch ---------------------------------
+LIVE() { echo "$STATE/live-$KEY.log"; }
+live() { printf '%s\n' "$*" >> "$(LIVE)"; }
+
+# ---- The test ----------------------------------------------------
+# Needs SNAP and RUN. Sets RESULT (PASS, FAIL, ERROR), RESULT_MSG (for the analyst),
+# RESULT_FILE (the saved review), RESULT_NOTE (extra line for you).
+# PASS_SUMMARY says what a pass covered, in plain words, for the log and the feed.
+RESULT=""; RESULT_MSG=""; RESULT_FILE=""; RESULT_NOTE=""; PASS_SUMMARY=""
+run_test() {
+  local wfs wf rc out t runs="" failed="" marker produced cb verdict changes work="$RUN/work" lockfd="" last
+  local parts=()
+  mapfile -t wfs < <(list_workflows "$SNAP")
+  RESULT=""; RESULT_MSG=""; RESULT_NOTE=""; PASS_SUMMARY=""; RESULT_FILE=$(review_file)
+  cb=$(claude_bin)
+  : > "$(LIVE)"; chmod 600 "$(LIVE)" 2>/dev/null
+  live "== agent-grid: manager test of $name, started $(date '+%H:%M') =="
+
+  # Excel workflows take turns, machine-wide
+  if uses_excel "$SNAP"; then
+    exec {lockfd}>"$STATE/excel.lock"
+    if ! flock -n "$lockfd"; then
+      set_status queued; log "manager: waiting for another Excel test to finish"; live "-- queued: another Excel test is running"
+      flock -w "$(cap "${EXCEL_WAIT:-3600}")" "$lockfd" || { RESULT=ERROR; RESULT_NOTE="Waited too long for another Excel test to finish."; return; }
+      set_status reviewing
+    fi
+  fi
+
+  # Your files: say so if they changed since the last test
+  last=$(cat "$STATE/user-$KEY.sha" 2>/dev/null)
+  if [ -n "$last" ] && [ "$last" != none ] && [ "$last" != "$(cat "$RUN/.user")" ]; then
+    RESULT_NOTE="Your checks, backtest files, or review.md changed since the last test. Make sure that was you."
+    notify "$name: your checks changed" "$RESULT_NOTE"
+  fi
+  cp "$RUN/.user" "$STATE/user-$KEY.sha"
+
+  # 1. Run each workflow once, exactly as written. The roll your checks read is removed
+  #    first, so a workflow that stops writing it can't pass on a stale copy.
+  clone "$work"
+  local rollp=""
+  [ -f "$SNAP/.agent-grid/checks.toml" ] && rollp=$(cd "$SNAP" && "$LEVY_CHECK" roll-path 2>/dev/null)
+  [ -n "$rollp" ] && rm -f "$work/$rollp"
+  marker=$(mktemp "$STATE/marker.XXXXXX")
+  for wf in "${wfs[@]}"; do
+    touch "$marker"
+    t=$(cap "${WORKFLOW_TIMEOUT:-900}")
+    out=$(cd "$work" && AGENT_GRID_NESTED=1 AGENT_GRID_AUTOPUSH=0 contain timeout "$t" \
+          bash ".agent-grid/workflows/$wf/run.sh" 2>&1); rc=$?
+    produced=$(find "$work" -type f -newer "$marker" -not -path '*/.agent-grid/*' 2>/dev/null | sed "s|^$work/||" | head -n 30)
+    [ $rc -eq 124 ] && out="$(printf '%s\n(stopped: ran longer than %s seconds)' "$out" "$t")"
+    [ $rc -ne 0 ] && { failed="$failed $wf"; record "$wf" "FAIL (didn't run)"; }
+    live "-- ran workflow $wf as written: exit $rc"
+    runs="$runs$(printf '\n### %s: exit code %s\nFiles written:\n%s\nLast output:\n%s\n' \
+                 "$wf" "$rc" "${produced:-(none)}" "$(printf '%s\n' "$out" | tail -n 40)")"
+  done
+  rm -f "$marker"
+  if [ -n "$failed" ]; then
+    RESULT=FAIL; live "== stopped: workflow(s) failed as written:$failed =="
+    RESULT_MSG=$(printf 'These workflows failed when run exactly as written, in a fresh copy of the folder:%s\n%s' "$failed" "$runs")
+    printf '# Workflow runs for %s\n\nCopy: %s\n%s\n' "$DIR" "$RUN" "$runs" > "$RESULT_FILE"
+    return
+  fi
+  parts+=("ran ${#wfs[@]} workflow(s) in a copy")
+
+  # 2. Your checks on this year's run, then the backtest on last year's
+  local checks="" bt_out="" crc=0 brc=0 bt="$RUN/backtest" bwf dest src
+  if [ -f "$SNAP/.agent-grid/checks.toml" ]; then
+    checks=$(cd "$work" && AGENT_GRID_NESTED=1 contain timeout "$(cap 600)" "$LEVY_CHECK" rules 2>&1); crc=$?
+    if [ $crc -ne 0 ] && [ $crc -ne 1 ]; then
+      RESULT=ERROR; RESULT_NOTE="Your checks.toml can't be used: $(printf '%s' "$checks" | tail -n 3 | tr '\n' ' ')"
+      printf '# Checks for %s\n\n%s\n' "$DIR" "$checks" > "$RESULT_FILE"; return
+    fi
+    bwf=$(cd "$SNAP" && "$LEVY_CHECK" backtest-inputs 2>&1); brc=$?
+    if [ $brc -ne 0 ]; then
+      RESULT=ERROR; RESULT_NOTE="Your backtest can't be run: $(printf '%s' "$bwf" | tail -n 3 | tr '\n' ' ')"
+      printf '# Backtest for %s\n\n%s\n' "$DIR" "$bwf" > "$RESULT_FILE"; return
+    fi
+    if [ -n "$bwf" ]; then
+      clone "$bt"; [ -n "$rollp" ] && rm -f "$bt/$rollp"
+      while IFS=$'\t' read -r dest src; do
+        [ -n "$dest" ] || continue
+        mkdir -p "$bt/$(dirname "$dest")" && cp "$SNAP/$src" "$bt/$dest"
+      done < <(printf '%s\n' "$bwf" | tail -n +2)
+      bt_out=$(cd "$bt" && AGENT_GRID_NESTED=1 AGENT_GRID_AUTOPUSH=0 contain timeout "$(cap "${WORKFLOW_TIMEOUT:-900}")" \
+               bash ".agent-grid/workflows/$(printf '%s\n' "$bwf" | head -n 1)/run.sh" 2>&1); brc=$?
+      if [ $brc -ne 0 ]; then
+        bt_out=$(printf "The backtest's workflow failed on last year's inputs (exit %s):\n%s" "$brc" "$(printf '%s\n' "$bt_out" | tail -n 30)")
+        brc=1
+      else
+        bt_out=$(cd "$bt" && AGENT_GRID_NESTED=1 contain timeout "$(cap 600)" "$LEVY_CHECK" backtest-compare 2>&1); brc=$?
+        [ $brc -gt 1 ] && { RESULT=ERROR; RESULT_NOTE="Your backtest can't be compared: $(printf '%s' "$bt_out" | tail -n 3 | tr '\n' ' ')"; return; }
+      fi
+      rm -rf "$bt"
+    else
+      RESULT_NOTE="${RESULT_NOTE:+$RESULT_NOTE }checks.toml has no backtest yet: add last year's certified roll and inputs to catch changes that alter old results."
+    fi
+    live "-- your checks:"; live "$checks"
+    [ -n "$bt_out" ] && { live "-- backtest:"; live "$bt_out"; }
+    record "your checks" "$([ $crc -eq 0 ] && echo PASS || echo FAIL)"
+    [ -n "$bwf" ] && record "backtest" "$([ $brc -eq 0 ] && echo PASS || echo FAIL)"
+    if [ $crc -ne 0 ] || [ $brc -ne 0 ]; then
+      RESULT=FAIL; live "== stopped: your checks or the backtest failed; back to the analyst =="
+      RESULT_MSG="Your work failed the user's own checks, which come from .agent-grid/checks.toml and .agent-grid/backtest/ (the user wrote these, not you; never edit them). Find and fix the cause in the code. If a check itself looks wrong, stop and explain why in your reply: don't change the code to fit it, and never special-case parcels to make it pass."
+      [ $crc -ne 0 ] && RESULT_MSG=$(printf "%s\n\nThis year's run:\n%s" "$RESULT_MSG" "$checks")
+      [ $brc -ne 0 ] && RESULT_MSG=$(printf "%s\n\nBacktest (last year's inputs through your code, compared with last year's certified roll):\n%s" "$RESULT_MSG" "$bt_out")
+      printf '# Checks for %s: FAIL\n\nCopy: %s\n\n%s\n\n## Runs\n%s\n' "$DIR" "$SROOT/$(base_slug)-last-failed" "$RESULT_MSG" "$runs" > "$RESULT_FILE"
+      return
+    fi
+    parts+=("your checks passed")
+    if [ -n "$bwf" ]; then parts+=("backtest passed"); else parts+=("no backtest yet"); fi
+
+    # Your hand-calculated parcels, kept outside the folder (spawn --spot). A mismatch comes
+    # to you, not the analyst: either the code or your figure is wrong, and the analyst
+    # never sees the figures, so it can't tune the code to them.
+    local spot="$SPOT_DIR/$KEY.toml" sp_out src
+    if [ -f "$spot" ]; then
+      sp_out=$(cd "$work" && AGENT_GRID_NESTED=1 AGENT_GRID_SPOT="$spot" contain timeout "$(cap 300)" "$LEVY_CHECK" spot 2>&1); src=$?
+      record "hand-calculated parcels" "$([ $src -eq 0 ] && echo PASS || echo FAIL)"
+      if [ $src -eq 1 ]; then
+        RESULT=SPOT; live "== stopped: your hand-calculated parcels don't match; handed to you =="
+        RESULT_NOTE="Your hand-calculated parcels don't match this roll. The analyst wasn't told. Decide whether the code or your figure is wrong."
+        printf '# Hand-calculated parcels for %s: MISMATCH\n\nCopy: %s\n\n%s\n' "$DIR" "$SROOT/$(base_slug)-last-failed" "$sp_out" > "$RESULT_FILE"
+        return
+      elif [ $src -ne 0 ]; then
+        RESULT=ERROR; RESULT_NOTE="Your hand-calculated parcels can't be checked: $(printf '%s' "$sp_out" | tail -n 2 | tr '\n' ' ')"
+        printf '# Hand-calculated parcels for %s\n\n%s\n' "$DIR" "$sp_out" > "$RESULT_FILE"; return
+      fi
+      parts+=("your hand-calculated parcels matched")
+    fi
+  else
+    parts+=("no checks.toml, so only the analyst's own criteria")
+    RESULT_NOTE="${RESULT_NOTE:+$RESULT_NOTE }No checks.toml, so this was checked against the analyst's own criteria only. Run levy-check init in the folder to start one."
+  fi
+
+  # 3. The manager tries to refute or break the work
+  [ -x "$cb" ] || { RESULT=ERROR; RESULT_NOTE="Claude isn't installed where the hook can find it."; return; }
+  changes=$(collect_changes | head -c 60000)
+  local history="" stream="$RUN/manager.jsonl"
+  [ -s "$(ROUNDS)" ] && history=$(printf '\n\n%s\n\n--- EARLIER ROUNDS ---\n%s' "$HISTORY_PROMPT" "$(tail -c 16000 "$(ROUNDS)")")
+  live "-- manager (a fresh Claude) is testing$([ -n "$history" ] && echo ", with the record of earlier rounds"):"
+  # stream-json lets spawn --watch follow along; the final answer is its "result" event
+  printf '%s%s%s\n\n--- YOUR CHECKS ---\n%s\n\n--- BACKTEST ---\n%s\n\n--- RUNS ---\n%s\n\n--- CHANGES ---\n%s\n' \
+      "$TEST_PROMPT" "$(folder_rules)" "$history" "${checks:-(none: no .agent-grid/checks.toml)}" "${bt_out:-(none set up)}" "$runs" "$changes" \
+    | ( cd "$work" && AGENT_GRID_NESTED=1 AGENT_GRID_AUTOPUSH=0 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_PROJECT_DIR="$work" contain timeout "$(cap "${TEST_TIMEOUT:-2400}")" \
+          "$cb" -p ${REVIEW_MODEL:+--model "$REVIEW_MODEL"} --output-format stream-json --verbose \
+          --allowedTools "${TEST_TOOLS:-Read,Grep,Glob,Bash,Edit,Write}" 2>&1 ) \
+    | tee "$stream" >> "$(LIVE)"
+  rc=${PIPESTATUS[1]}
+  out=$(jq -Rr 'fromjson? | select(.type? == "result") | .result // empty' "$stream" 2>/dev/null)
+  # Not stream-json at all (an older Claude): use the raw text. Stream-json with no
+  # final answer means the manager didn't finish, so it stays empty and counts as that.
+  if [ -z "$out" ] && ! jq -Rr 'fromjson? | .type? // empty' "$stream" 2>/dev/null | grep -q .; then
+    out=$(cat "$stream")
+  fi
+  jq -Re 'fromjson? | select(.type? == "result") | .is_error == true' "$stream" >/dev/null 2>&1 && rc=1
+  verdict=$(printf '%s\n' "$out" | grep -oE 'VERDICT: *(PASS|FAIL)' | tail -n 1 | grep -oE 'PASS|FAIL')
+  if [ $rc -ne 0 ] || [ -z "$verdict" ]; then
+    RESULT=ERROR
+    if [ "$rc" = 124 ]; then RESULT_NOTE="The manager ran out of time (TEST_TIMEOUT)."
+    elif [ "$rc" = 0 ]; then RESULT_NOTE="The manager stopped without giving a verdict."
+    else RESULT_NOTE="The manager stopped with an error (exit $rc)."; fi
+    live "== $RESULT_NOTE =="
+    printf '# Workflow test of %s\n\nCopy: %s\n\n%s\n\n## Runs\n%s\n' "$DIR" "$RUN" "$out" "$runs" > "$RESULT_FILE"
+    return
+  fi
+  printf '%s\n' "$out" | grep -oE 'WORKFLOW +[A-Za-z0-9._-]+: *(PASS|FAIL)' | sed -E 's/WORKFLOW +//; s/: */\t/' \
+    | while IFS=$'\t' read -r wf rc; do record "$wf" "$rc"; done
+
+  live "== manager verdict: $verdict =="
+  if [ "$verdict" = PASS ]; then
+    RESULT=PASS; parts+=("the manager found nothing")
+    PASS_SUMMARY=$(printf '%s; ' "${parts[@]}"); PASS_SUMMARY=${PASS_SUMMARY%; }
+    printf '# Workflow test of %s: PASS\n\n%s\n\n## Runs\n%s\n' "$DIR" "$out" "$runs" > "$RESULT_FILE"
+    return
+  fi
+  RESULT=FAIL
+  RESULT_MSG=$(printf 'Your manager tried to refute or break your work, and found problems. Fix the real ones. If you are confident a finding is wrong, explain why in your reply instead of changing anything. Manager findings:\n%s' \
+    "$(printf '%s\n' "$out" | tail -c 6000)")
+  printf '# Workflow test of %s: FAIL\n\nCopy with the manager'"'"'s test inputs: %s\n\n%s\n\n## Runs\n%s\n' \
+    "$DIR" "$SROOT/$(base_slug)-last-failed" "$out" "$runs" > "$RESULT_FILE"
+}
+
+# ---- Passing on the result ---------------------------------------
+save_note() {   # notes are for you: into the saved review and the log
+  [ -n "$RESULT_NOTE" ] || return 0
+  [ -f "$RESULT_FILE" ] && printf '\nNote: %s\n' "$RESULT_NOTE" >> "$RESULT_FILE"
+  [ "$RESULT" != ERROR ] && [ "$RESULT" != SPOT ] && log "manager note: $RESULT_NOTE"
+  return 0
+}
+mark_passed() {   # the next test starts from the moment this snapshot was taken
+  clear_rounds; rm -f "$STATE/wfsent-$KEY"
+  touch -r "$RUN/.started" "$STATE/review-$KEY.stamp"
+  if [ -s "$RUN/.head" ]; then cp "$RUN/.head" "$STATE/review-$KEY.sha"; else rm -f "$STATE/review-$KEY.sha"; fi
+  reset_tries review; reset_tries workflow
+}
+
+# Analyst-facing round counting. Returns 1 if sent back, 2 if handed to the user.
+next_round() {
+  local n max="${REVIEW_MAX:-2}"
+  n=$(bump review)
+  if [ "$n" -le "$max" ]; then ROUND="round $n of $max"; return 1; fi
+  reset_tries review; return 2
+}
+
+# The result goes straight back: to the analyst, or to you
+deliver_now() {   # returns 0 passed, 1 blocked, 2 handed to you
+  save_note
+  case "$RESULT" in
+    PASS)
+      mark_passed; cp -p "$RUN/.started" "$STATE/started-$KEY" 2>/dev/null; TESTED=1
+      finish_run pass
+      log "manager: passed: ${PASS_SUMMARY:-all tests}"; return 0 ;;
+    SPOT)
+      finish_run keep
+      log "manager: your hand-calculated parcels don't match the roll, so it's handed to you (the analyst wasn't told). See ${RESULT_FILE/#$HOME/$TILDE}"
+      set_status flagged
+      notify "$name: your parcels don't match" "The roll disagrees with your hand-calculated parcels. Nothing was pushed."; return 2 ;;
+    FAIL)
+      finish_run keep
+      next_round; case $? in
+        1) log "manager: found problems ($ROUND), sent back to the analyst. See ${RESULT_FILE/#$HOME/$TILDE}"
+           set_status working; record_round "$RESULT_MSG"; await_reply
+           block "$(printf 'agent-grid (manager, %s): %s' "$ROUND" "$RESULT_MSG")"; return 1 ;;
+        *) log "manager: still flagged after ${REVIEW_MAX:-2} rounds, handed back to you. See ${RESULT_FILE/#$HOME/$TILDE}"
+           set_status flagged
+           notify "$name: manager flagged" "Problems remain after ${REVIEW_MAX:-2} rounds. Take a look."; return 2 ;;
+      esac ;;
+    *)
+      finish_run keep
+      log "manager: stopped, handed back to you. $RESULT_NOTE"
+      set_status flagged
+      notify "$name: manager needs you" "$RESULT_NOTE Nothing was pushed."; return 2 ;;
+  esac
+}
+
+read_only_review() {   # folders where no code changed and there are no workflows
+  local changes out rc verdict cb n text
+  # Only data or output files changed (the analyst ran something): nothing to read, and
+  # nothing to run without a workflow. Say so instead of calling it a review.
+  text=$(changed_files | grep -v '^\.agent-grid/' | grep -E "\.($EXT|json|yaml|yml|ini|cfg|txt)$" | head -n 1)
+  if [ -z "$text" ]; then
+    log "manager: nothing to review: only data or output files changed, and there's no workflow to run"
+    touch "$STATE/review-$KEY.stamp"
+    git -C "$DIR" rev-parse -q --verify HEAD > "$STATE/review-$KEY.sha" 2>/dev/null || rm -f "$STATE/review-$KEY.sha"
+    return 0
+  fi
+  changes=$(collect_changes | head -c 80000)
+  [ -n "$(printf '%s' "$changes" | tr -d '[:space:]')" ] || return 0
+  cb=$(claude_bin); [ -x "$cb" ] || { log "manager: skipped (claude not found)"; return 0; }
+  set_status reviewing
+  out=$(cd "$DIR" && printf '%s%s\n\n--- CHANGES ---\n%s\n' "$READ_PROMPT" "$(folder_rules)" "$changes" \
+        | AGENT_GRID_NESTED=1 AGENT_GRID_AUTOPUSH=0 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 timeout "$(cap "${REVIEW_TIMEOUT:-300}")" \
+          "$cb" -p ${REVIEW_MODEL:+--model "$REVIEW_MODEL"} \
+          --allowedTools "${REVIEW_TOOLS:-Read,Grep,Glob}" \
+          --disallowedTools "Edit,Write,MultiEdit,NotebookEdit" 2>&1); rc=$?
+  verdict=$(printf '%s\n' "$out" | grep -oE 'VERDICT: *(PASS|FAIL)' | tail -n 1 | grep -oE 'PASS|FAIL')
+  RESULT_FILE=$(review_file); printf '# Review of %s\n\n%s\n' "$DIR" "$out" > "$RESULT_FILE"
+  if [ $rc -ne 0 ] || [ -z "$verdict" ]; then
+    log "manager: couldn't finish its review (exit $rc), skipped. See ${RESULT_FILE/#$HOME/$TILDE}"; return 0
+  fi
+  if [ "$verdict" = PASS ]; then
+    reset_tries review; log "manager: read-only review found no problems (no workflow, so nothing was run)"
+    touch "$STATE/review-$KEY.stamp"
+    git -C "$DIR" rev-parse -q --verify HEAD > "$STATE/review-$KEY.sha" 2>/dev/null || rm -f "$STATE/review-$KEY.sha"
+    return 0
+  fi
+  max="${REVIEW_MAX:-2}"; n=$(bump review)
+  if [ "$n" -le "$max" ]; then
+    log "manager: read-only review found problems (round $n of $max), sent back to the analyst. See ${RESULT_FILE/#$HOME/$TILDE}"
+    set_status working
+    block "$(printf 'agent-grid: your manager reviewed your work and tried to break it, and found problems (round %s of %s). Fix the real ones. If you are confident a finding is wrong, explain why in your reply instead of changing the code. Manager review:\n%s' \
+             "$n" "$max" "$(printf '%s\n' "$out" | tail -c 6000)")"
+    return 1
+  fi
+  reset_tries review
+  log "manager: still flagged after $max rounds, handed back to you. See ${RESULT_FILE/#$HOME/$TILDE}"
+  set_status flagged
+  notify "$name: manager flagged" "The manager still sees problems after $max rounds. Take a look."
+  return 2
+}
+
+# ---- Step 2: the manager -----------------------------------------
+review_enabled() { [ "${AGENT_GRID_REVIEW:-0}" = 1 ] || [ -f "$AG/review.md" ]; }
+
+run_manager() {   # returns 0 = passed/skipped, 1 = blocked, 2 = handed to you
+  review_enabled || return 0
+  local wfs problems
+  needs_test || return 0
+
+  mapfile -t wfs < <(list_workflows)
+  if [ ${#wfs[@]} -eq 0 ]; then
+    local code; code=$(changed_files | grep -v '^\.agent-grid/' | grep -E "\.($CODE_ONLY)$" | head -n 5 | paste -sd, - | sed 's/,/, /g')
+    if [ -n "$code" ]; then
+      flag_workflow_problem "You changed code in this folder ($code), but there is no workflow for the manager to run and test." \
+        "no workflow, code changed: $code"
+      return $?
+    fi
+    read_only_review; return $?
+  fi
+  problems=$(check_workflows "${wfs[@]}")
+  if [ -n "$problems" ]; then
+    flag_workflow_problem "$(printf 'The workflows need fixing before the manager can test them:\n%s' "$problems")" \
+      "$(printf '%s' "$problems" | head -n 1 | sed 's/^- //' | cut -c1-90)"
+    return $?
+  fi
+  reset_tries workflow; rm -f "$STATE/wfsent-$KEY"
+
+  local rc; make_snapshot; rc=$?
+  if [ $rc -eq 3 ]; then
+    log "manager: folder is over WORKFLOW_COPY_MAX_MB, so workflows weren't run; read-only review instead"
+    read_only_review; return $?
+  elif [ $rc -ne 0 ]; then
+    log "manager: couldn't copy the folder to test in ($SROOT)"
+    set_status flagged; notify "$name: manager couldn't test" "Couldn't copy the folder to run the workflows. See spawn --doctor."
+    return 2
+  fi
+
+  set_status reviewing
+  can_contain && CONTAINED=1
+  run_test
+  deliver_now
+}
+
+# Findings that came back while the analyst was busy
+# ---- Stop --------------------------------------------------------
+handle_stop() {
+  local rc; TESTED=0
+  capture_reply
+  run_verify; case $? in 1|2) return ;; esac          # never push work that fails checks
+  run_manager; rc=$?
+  prune
+  case $rc in 1|2) return ;; esac                     # or that the manager hasn't passed
+  set_status "done"
+  if ! looking; then
+    local last; last=$(jget .last_assistant_message | tr '\n' ' ' | cut -c1-140)
+    notify "$name finished" "${last:-Claude finished its turn.}"
+  fi
+  # Push only what was tested: a hand edit during the test waits for the next one
+  if [ "$TESTED" = 1 ] && changed_since "$STATE/started-$KEY"; then
+    log "manager: not pushing; the folder changed while it was being tested, so the next test covers it"
+  else auto_push; fi
+}
+
+BRIEFING='agent-grid: you are an analyst agent with a manager. When you finish a turn that changed code, the manager runs every workflow in .agent-grid/workflows/ in a copy of this folder, runs the user'"'"'s checks and backtest (.agent-grid/checks.toml), and tries to refute or break your work. Problems come back to you. If there is no workflow for the code you change, your turn is sent back. The user'"'"'s checks are read-only to you: agent-grid blocks edits to them.'
+
+# ---- Before a tool runs: your files stay yours -------------------
+# In analyst sessions, edits to your checks, backtest, and review.md are blocked, and so
+# is any look at your hand-calculated parcels. Exit 2 blocks the tool call, and Claude
+# sees the message. A script that writes there anyway is still caught at the next test.
+PROTECTED='\.agent-grid/(checks\.toml|review\.md|backtest)'
+deny() { printf 'agent-grid: %s\n' "$1" >&2; exit 2; }
+pre_tool() {
+  local tool p rel cmd cwd ins
+  tool=$(jget .tool_name)
+  ins=$(printf '%s' "$input" | jq -r '[.tool_input.file_path, .tool_input.notebook_path, .tool_input.path,
+           .tool_input.pattern, .tool_input.command] | map(select(. != null) | tostring) | join("\n")' 2>/dev/null)
+  # agent-grid's own data: your hand-calculated parcels, saved reviews (a mismatch review
+  # shows your figures), live logs, and settings. Analysts never need any of it.
+  case "$ins" in
+    *"$SPOT_DIR"*|*"$STATE"*|*"$(dirname "$SPOT_DIR")"*|*.config/agent-grid*|*.local/state/agent-grid*)
+      deny "that's agent-grid's own data for the user (their hand-calculated parcels, the manager's saved reviews, and settings). Analysts don't read it: the manager compares the user's figures with your roll." ;;
+  esac
+  cwd=$(jget .cwd); cwd="${cwd:-$DIR}"
+  case "$tool" in
+    Edit|Write|MultiEdit|NotebookEdit)
+      p=$(printf '%s' "$input" | jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' 2>/dev/null)
+      [ -n "$p" ] || return 0
+      case "$p" in /*) ;; *) p="$cwd/$p" ;; esac
+      p=$(realpath -m "$p" 2>/dev/null || printf '%s' "$p")
+      rel="${p#"$DIR"/}"
+      [ "$rel" != "$p" ] || return 0
+      if printf '%s' "${rel,,}" | grep -qE "^${PROTECTED}"; then
+        deny "$rel belongs to the user (their checks, last year's certified results, or their folder rules), so analysts can't change it. If you believe it's wrong, stop and explain why in your reply. Don't change the code to fit it either."
+      fi ;;
+    Bash)
+      cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)
+      printf '%s' "$cmd" | grep -qE "$PROTECTED" || return 0
+      if printf '%s' "$cmd" | grep -qE ">>?[[:space:]]*[\"']?[^[:space:]|;&]*${PROTECTED}|(^|[;&|[:space:](])(tee|rm|mv|truncate|chmod|unlink)[[:space:]][^|;&]*${PROTECTED}|sed[[:space:]][^|;&]*-i[^|;&]*${PROTECTED}|${PROTECTED}[^|;&]*(write_text|write_bytes|\.save\(|to_csv\(|to_excel\()|open\([^)]*${PROTECTED}[^)]*,[^)]*[\"'][wax]"; then
+        deny "that command would change the user's checks, backtest, or review.md, which analysts can't change. Reading them is fine. If you believe one is wrong, stop and explain why in your reply."
+      fi ;;
+  esac
+  return 0
+}
+
+# ---- Main --------------------------------------------------------
+jget() { printf '%s' "$input" | jq -r "$1 // empty" 2>/dev/null; }
+input=""
+case "${1:-}" in
+  --test)
+    setup_dir "${2:-.}"; pane_name
+    mapfile -t wfs < <(list_workflows)
+    [ ${#wfs[@]} -gt 0 ] || { echo "No workflows in $WFDIR."; exit 2; }
+    problems=$(check_workflows "${wfs[@]}"); [ -z "$problems" ] || { printf 'Fix the workflows first:\n%s\n' "$problems"; exit 2; }
+    HOOK_BUDGET=86400
+    make_snapshot || { echo "Couldn't copy the folder to $SROOT."; exit 2; }
+    can_contain && CONTAINED=1
+    [ "$CONTAINED" = 1 ] || echo "Note: running without containment (bubblewrap not available)."
+    echo "Testing ${#wfs[@]} workflow(s) in $DIR ..."
+    run_test; save_note
+    case "$RESULT" in PASS) finish_run pass ;; *) finish_run keep ;; esac
+    echo "RESULT: $RESULT"
+    [ -n "$RESULT_NOTE" ] && echo "NOTE: $RESULT_NOTE"
+    [ -n "$RESULT_MSG" ] && printf '%s\n' "$RESULT_MSG" | head -c 6000 && echo
+    [ "$RESULT" = PASS ] || echo "COPY: $RUN"
+    echo "REPORT: $RESULT_FILE"
+    log "manager: tested from the command line, $RESULT"
+    [ "$RESULT" = PASS ]; exit $? ;;
+  --clean)
+    for d in "${WORKFLOW_SANDBOX:-}" "${TMPDIR:-/tmp}/agent-grid-$(id -u)" "${WIN_HOME:+$WIN_HOME/AppData/Local/Temp/agent-grid}"; do
+      [ -n "$d" ] && [ -d "$d" ] && rm -rf "$d" && echo "Deleted $d"
+    done
+    rm -f "$STATE"/live-*.log; exit 0 ;;
+esac
+
+# Hook mode. The manager (or a check script) that runs Claude must not trigger this again.
+[ "${AGENT_GRID_NESTED:-0}" = 1 ] && exit 0
+input=$(cat)
+if ! command -v jq >/dev/null; then
+  case "$input" in *'"Stop"'*) [ -x "$HOME/.local/bin/auto-commit" ] && "$HOME/.local/bin/auto-commit" >/dev/null 2>&1 ;; esac
+  exit 0
+fi
+event=$(jget .hook_event_name)
+session=$(jget .session_id)
+d="${CLAUDE_PROJECT_DIR:-$(jget .cwd)}"
+setup_dir "${d:-$PWD}"
+
+# Runs before every tool call in every Claude session, so it returns fast when the
+# session isn't a managed analyst
+if [ "$event" = PreToolUse ]; then
+  [ "${AGENT_GRID_SETUP:-0}" = 1 ] || ! review_enabled || pre_tool
+  exit 0
+fi
+
+pane="${TMUX_PANE:-}"; find_pane; pane_name
+
+# A setup session (spawn --setup) writes your checks. It's never reviewed; the pane just
+# shows what it's doing, and when its summary is waiting for you.
+if [ "${AGENT_GRID_SETUP:-0}" = 1 ]; then
+  case "$event" in
+    UserPromptSubmit) set_status setup ;;
+    Notification)
+      ntype=$(jget .notification_type)
+      [ "$ntype" = idle_prompt ] && [ "$(get_status)" = setup-ready ] && exit 0
+      set_status waiting; notify "$name setup needs you" "$(jget .message)" ;;
+    Stop)
+      set_status setup-ready
+      looking || notify "$name: checks ready for you" "Read the setup summary, answer its questions, then type /exit." ;;
+  esac
+  exit 0
+fi
+
+case "$event" in
+  UserPromptSubmit)
+    set_status working
+    brief="$STATE/briefed-$KEY-${session:-none}"
+    if review_enabled && [ ! -f "$brief" ]; then
+      touch "$brief"
+      # The first time a folder is managed, this is the starting point: only changes
+      # from here on are the analyst's. Your earlier edits aren't reviewed as its work.
+      if [ ! -f "$STATE/review-$KEY.stamp" ]; then
+        touch "$STATE/review-$KEY.stamp"
+        git -C "$DIR" rev-parse -q --verify HEAD > "$STATE/review-$KEY.sha" 2>/dev/null || rm -f "$STATE/review-$KEY.sha"
+        log "manager: starting point set; the analyst's changes from now on are reviewed"
+      fi
+      find "$STATE" -maxdepth 1 -name 'briefed-*' -mtime +7 -delete 2>/dev/null
+      printf '%s\n\n%s\n' "$BRIEFING" "$WORKFLOW_HELP"
+    fi ;;
+  Notification)
+    ntype=$(jget .notification_type)
+    cur=$(get_status)
+    if [ "$ntype" = idle_prompt ] && { [ "$cur" = "done" ] || [ "$cur" = failed ] || [ "$cur" = flagged ]; }; then exit 0; fi
+    set_status waiting
+    notify "$name needs you" "$(jget .message)" ;;
+  Stop)
+    handle_stop ;;
+esac
+exit 0

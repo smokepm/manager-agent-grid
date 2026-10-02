@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# auto-commit: called by agent-hook after every Claude turn (once checks pass).
+# Only acts in Claude sessions started with `spawn --gh` (AGENT_GRID_AUTOPUSH=1),
+# in folders connected to GitHub. Commits code changes and pushes. Only tracked
+# files and new files matching CODE_EXT are staged, so data files stay local.
+# Activity is logged to ~/.local/state/agent-grid/auto-commit.log (see spawn --doctor).
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/agent-grid/config"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+EXT="${CODE_EXT:-py|md|toml|ts|tsx|js|jsx|sh|sql|r|R|go|rs}"
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/agent-grid"
+LOG="$LOG_DIR/auto-commit.log"
+DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+TILDE='~'
+
+log() {
+  mkdir -p "$LOG_DIR"
+  printf '%s  %s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${DIR/#$HOME/$TILDE}" "$*" >> "$LOG"
+  if [ "$(wc -l < "$LOG")" -gt 1000 ]; then tail -n 500 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"; fi
+}
+
+cd "$DIR" || exit 0
+connected=0
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && git remote get-url origin >/dev/null 2>&1; then
+  connected=1
+fi
+
+if [ "${AGENT_GRID_AUTOPUSH:-0}" != 1 ]; then
+  [ $connected -eq 1 ] && log "skipped: not a --gh session"
+  exit 0
+fi
+[ $connected -eq 1 ] || { log "skipped: folder isn't connected to GitHub (run gh-connect)"; exit 0; }
+
+git add -u
+# Your checks and backtest files hold client results, so new ones stay local
+git ls-files -o --exclude-standard | grep -E "\.($EXT)$" | grep -vE '^\.agent-grid/(checks\.toml|backtest/)' \
+  | xargs -r -d '\n' git add --
+
+committed=0
+if ! git diff --cached --quiet; then
+  git commit -qm "Auto-save $(date '+%Y-%m-%d %H:%M')" && committed=1
+fi
+
+if out=$(timeout 30 git push -qu origin HEAD 2>&1); then
+  if [ $committed -eq 1 ]; then log "pushed $(git rev-parse --short HEAD)"; else log "up to date"; fi
+else
+  msg=$(printf '%s\n' "$out" | grep -m1 -iE 'fatal|error|rejected|denied' || printf '%s\n' "$out" | tail -n 1)
+  log "push failed: $msg"
+fi
+exit 0

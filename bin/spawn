@@ -1,0 +1,818 @@
+#!/usr/bin/env bash
+# spawn: pick folders, open each in a tmux pane running a command (default: claude).
+#
+# Usage:
+#   spawn                         pick folders under the current directory
+#   spawn -b ~/projects           pick folders under ~/projects
+#   spawn api web                 open ./api and ./web directly (no picker)
+#   spawn --gh                    also connect each folder to GitHub and auto-push
+#                                 Claude's code changes after every turn
+#
+# Every launch comes with a manager: a "manager" pane, and a fresh Claude that, each
+# time an analyst finishes, runs its workflows and your checks in a copy of the folder,
+# tries to refute or break the work, and sends real problems back. Turn it off with --no-manager (or REVIEW_DEFAULT=0 in the config).
+#   spawn --worktrees 3           three agents on this repo, each on its own branch
+#   spawn -w NAME                 open a saved workspace
+#   spawn --prompt-file TASK.md   start every agent on its folder's TASK.md
+#   spawn --overview              see every agent's status and jump to one
+#   spawn -r                      resume each folder's last Claude conversation
+#   spawn -c "npm run dev"        run any command instead of claude
+#   spawn -c ""                   plain shells
+#   spawn -t                      one tab per folder instead of a tiled grid
+#
+# Options:
+#   --gh, -g         GitHub mode: connect unconnected folders (pick a repo or create
+#                    a private one), then auto-push code after every Claude turn
+#   --no-gh          turn GitHub mode off (e.g. for a workspace saved with --gh)
+#   --no-manager     launch without the manager (no reviews, no manager pane)
+#   --manager        turn the manager on (if it's off in the config or a workspace)
+#   --worktrees N    N agents on one git repo (the base folder, or the folder given),
+#                    each in its own worktree and branch (claude --worktree)
+#   --close          close the pane when the command exits (default: keep a shell)
+#   -b DIR           base directory to pick from (default: current directory)
+#   -c CMD           command for each pane (default: claude). Empty = plain shell.
+#   -r               resume: claude --continue, or a fresh claude if no history
+#   -t               tabs: one tmux window per folder
+#   -d N             folder depth shown in the picker (default: 2)
+#   -s NAME          tmux session to add to (default: TMUX_SESSION in config, else grid)
+#   -x SUFFIX        suggest "<folder>-SUFFIX" for new repos in --gh mode
+#   -p TEXT          picker prompt label
+#
+# Orchestration:
+#   --prompt TEXT        start each agent with this prompt
+#   --prompt-file FILE   start each agent with a file's contents. A relative name
+#                        is read from each folder first (e.g. a TASK.md per folder)
+#   --overview           list all agents with status (needs you / checks failed /
+#                        done / working) and a live preview; Enter jumps to one
+#   --send [TEXT]        send a message to running agents (pick which; --all for every one)
+#   --summary            one-line status count (used by the tmux status bar)
+#   --manager-feed       the manager pane's live view (agents, reviews, findings)
+#
+# The manager:
+#   --setup [DIR]        have Claude set up a folder's checks: it finds the roll, last
+#                        year's certified roll and inputs, writes checks.toml, and shows
+#                        you where every number came from. spawn offers this at launch
+#                        for any folder without checks.
+#   --spot [DIR]         your hand-calculated parcels for a folder: kept outside it, so
+#                        analysts never see them; the manager compares the roll with them
+#   --test [DIR]         run the manager's test on a folder now, in the foreground
+#   --watch [DIR]        follow the manager's test of a folder live, and each one after
+#                        it (Ctrl+b W does this for the pane you're in)
+#   --clean              delete every test copy (they hold client data)
+#
+# Workspaces:
+#   --save NAME      save this launch (base, folders, options) as a workspace.
+#                    Pick nothing to save just the base folder (opens the picker).
+#   -w NAME          open a workspace. Options given with it override what's saved.
+#   --list           list saved workspaces
+#   --forget NAME    delete a workspace
+#
+# Other:
+#   --doctor         check the setup and recent auto-push activity
+#   --version        show the version
+#   -h, --help       show this help
+#
+# Picker keys: type to filter, Enter adds a folder, Tab marks several,
+# Esc or [ Done ] launches. "." means the base folder itself.
+
+export PATH="$HOME/.local/bin:$PATH"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/agent-grid"
+CONF="$CONF_DIR/config"
+WS_DIR="$CONF_DIR/workspaces"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/agent-grid"
+LOG="$STATE_DIR/auto-commit.log"
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+TILDE='~'
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+ORIG_PWD="$PWD"; BASE="$PWD"; CMD="claude"; DEPTH=2; SESSION="${TMUX_SESSION:-grid}"
+TABS=0; CLOSE=0; LABEL="spawn"; GH=0; SUFFIX=""; WT=0; SAVE=""; WS=""
+PROMPT=""; PROMPT_FILE=""; SEND=0; SEND_TEXT=""; SEND_ALL=0; REVIEW="${REVIEW_DEFAULT:-1}"
+WS_FOLDERS=(); FOLDERS=()
+
+die()   { echo "$*" >&2; exit 1; }
+warn()  { printf '\033[1;33m!!  %s\033[0m\n' "$*"; }
+usage() { awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$0"; exit 0; }
+version() { cat "$ROOT/VERSION" 2>/dev/null || echo "unknown"; }
+short() { echo "${1/#$HOME/$TILDE}"; }
+sq() { local q="'\\''"; printf "'%s'" "${1//\'/$q}"; }   # shell-quote with single quotes
+
+# ---- Workspaces --------------------------------------------------
+ws_file() { echo "$WS_DIR/$1.ws"; }
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || die "Workspace names can use letters, numbers, . _ - (got '$1')"; }
+
+load_ws() {
+  local f; f=$(ws_file "$1")
+  [ -f "$f" ] || die "No workspace '$1'. See: spawn --list"
+  WS_FOLDERS=()
+  # shellcheck disable=SC1090
+  . "$f"
+  BASE="$WS_BASE"; GH="${WS_GH:-0}"; TABS="${WS_TABS:-0}"; CLOSE="${WS_CLOSE:-0}"
+  CMD="${WS_CMD-claude}"; SUFFIX="${WS_SUFFIX:-}"; WT="${WS_WORKTREES:-0}"; LABEL="$1"
+  REVIEW="${WS_REVIEW:-$REVIEW}"
+}
+
+save_ws() {
+  mkdir -p "$WS_DIR"
+  {
+    echo "# agent-grid workspace. Open with: spawn -w $1"
+    printf 'WS_BASE=%q\n' "$BASE"
+    printf 'WS_GH=%q\nWS_TABS=%q\nWS_CLOSE=%q\nWS_WORKTREES=%q\nWS_REVIEW=%q\n' "$GH" "$TABS" "$CLOSE" "$WT" "$REVIEW"
+    printf 'WS_CMD=%q\nWS_SUFFIX=%q\n' "$CMD" "$SUFFIX"
+    printf 'WS_FOLDERS=('
+    [ ${#FOLDERS[@]} -gt 0 ] && printf ' %q' "${FOLDERS[@]}"
+    printf ' )\n'
+  } > "$(ws_file "$1")"
+  echo "Saved workspace '$1'. Open it with: spawn -w $1"
+}
+
+list_ws() {
+  local files f
+  shopt -s nullglob; files=("$WS_DIR"/*.ws); shopt -u nullglob
+  [ ${#files[@]} -gt 0 ] || { echo "No saved workspaces. Create one with: spawn --save NAME"; return; }
+  for f in "${files[@]}"; do
+    (
+      WS_FOLDERS=()
+      # shellcheck disable=SC1090
+      . "$f"
+      desc="${#WS_FOLDERS[@]} folders"
+      [ ${#WS_FOLDERS[@]} -eq 0 ] && desc="picker"
+      [ "${WS_WORKTREES:-0}" -gt 0 ] && desc="${WS_WORKTREES} worktrees"
+      flags=""
+      [ "${WS_GH:-0}" = 1 ] && flags="$flags --gh"
+      [ "${WS_REVIEW:-1}" = 0 ] && flags="$flags --no-manager"
+      [ "${WS_TABS:-0}" = 1 ] && flags="$flags -t"
+      printf '  %-16s %s  (%s)%s\n' "$(basename "$f" .ws)" "$(short "$WS_BASE")" "$desc" "$flags"
+    )
+  done
+}
+
+# ---- Doctor ------------------------------------------------------
+# "~/..." strings below are display text, not paths
+# shellcheck disable=SC2088
+doctor() {
+  local fails=0 v l t S
+  ok()  { printf '  \033[32mok\033[0m    %s\n' "$*"; }
+  bad() { printf '  \033[31mFIX\033[0m   %s\n' "$*"; fails=$((fails + 1)); }
+  meh() { printf '  \033[33mnote\033[0m  %s\n' "$*"; }
+
+  echo "agent-grid $(version) doctor"
+  echo
+  if command -v tmux >/dev/null; then
+    v=$(tmux -V | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    if printf '%s\n' 3.2 "$v" | sort -V -C; then ok "tmux $v"; else bad "tmux $v is too old (popups need 3.2+)"; fi
+  else bad "tmux is missing"; fi
+  if command -v fzf >/dev/null; then ok "fzf"; else bad "fzf is missing (the picker needs it)"; fi
+  if command -v awk >/dev/null; then ok "awk"; else bad "awk is missing (the manager feed and help need it): sudo dnf install gawk, or sudo apt install gawk"; fi
+  if command -v git >/dev/null; then ok "git"; else bad "git is missing"; fi
+  if command -v claude >/dev/null; then ok "claude $(claude --version 2>/dev/null | head -1)"
+  else bad "Claude Code is missing: curl -fsSL https://claude.ai/install.sh | bash"; fi
+
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ok "~/.local/bin is on PATH" ;;
+    *) bad "~/.local/bin isn't on PATH (open a new terminal)" ;;
+  esac
+  for t in spawn agent-hook gh-connect auto-commit; do
+    l=$(command -v "$t" || true)
+    if [ -n "$l" ]; then ok "$t -> $(short "$(readlink -f "$l")")"; else bad "$t not found (re-run install.sh)"; fi
+  done
+
+  if [ -f "$CONF" ]; then
+    ok "config: autostart=${TMUX_AUTOSTART:-0}, session=${TMUX_SESSION:-grid}, gh owner=${GH_ORG:-your account}"
+  else meh "no config yet (install.sh creates $(short "$CONF"))"; fi
+  if grep -q 'agent-grid' ~/.tmux.conf 2>/dev/null; then ok "~/.tmux.conf loads agent-grid"
+  else bad "~/.tmux.conf doesn't load agent-grid (re-run install.sh)"; fi
+  if grep -q 'agent-grid' ~/.zshrc 2>/dev/null; then ok "~/.zshrc hooks"
+  else meh "~/.zshrc hooks missing (re-run install.sh)"; fi
+
+  S="$HOME/.claude/settings.json"
+  if [ ! -f "$S" ] || ! command -v jq >/dev/null; then meh "can't check the Claude hook (no settings.json or jq)"
+  elif ! jq empty "$S" 2>/dev/null; then bad "$(short "$S") isn't valid JSON"
+  else
+    for e in Stop Notification UserPromptSubmit PreToolUse; do
+      if jq -e --arg e "$e" '[.hooks[$e][]?.hooks[]?.command] | any(test("agent-hook"))' "$S" >/dev/null; then
+        ok "Claude $e hook"
+      else bad "Claude $e hook missing (re-run install.sh)"; fi
+    done
+  fi
+
+  if [ "${CONTAIN:-1}" != 1 ]; then meh "manager containment is off (CONTAIN=0): test runs can write outside their copy"
+  elif ! command -v bwrap >/dev/null; then bad "bubblewrap is missing, so test runs can write outside their copy (sudo dnf install bubblewrap, or sudo apt install bubblewrap)"
+  elif ! bwrap --ro-bind / / --dev /dev --proc /proc true >/dev/null 2>&1; then
+    bad "bubblewrap is installed but can't run here (on Ubuntu 24.04+: sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0, or set CONTAIN=0)"
+  else
+    ok "manager containment (bubblewrap): test runs can only write inside their copy"
+    if [ -n "$WSL_DISTRO_NAME" ]; then
+      if bwrap --ro-bind / / --dev /dev --proc /proc /mnt/c/Windows/System32/cmd.exe /c exit >/dev/null 2>&1; then
+        ok "Windows programs (winpy) run inside containment"
+        meh "Windows programs are outside Linux containment: they can write anywhere on Windows. Keep workflow outputs inside the folder."
+      else bad "Windows programs don't start inside containment, so winpy workflows will fail. Set CONTAIN=0 to test them uncontained"; fi
+    fi
+  fi
+  local py="$HOME/.venv/bin/python"; [ -x "$py" ] || py=python3
+  if "$py" -c 'import tomllib, openpyxl' 2>/dev/null; then ok "levy-check ($("$py" --version 2>&1), reads .csv and .xlsx)"
+  elif "$py" -c 'import tomllib' 2>/dev/null; then meh "levy-check can't read .xlsx rolls: $py -m pip install openpyxl"
+  else bad "levy-check needs Python 3.11+ ($("$py" --version 2>&1) found)"; fi
+  if command -v flock >/dev/null; then ok "flock (Excel tests take turns)"
+  else bad "flock is missing (util-linux)"; fi
+
+  if ! command -v gh >/dev/null; then meh "gh is missing (only needed for --gh)"
+  elif gh auth status >/dev/null 2>&1; then ok "gh logged in as $(gh api user -q .login 2>/dev/null)"
+  else meh "gh isn't logged in (spawn --gh will walk you through it)"; fi
+  if [ -n "$(git config --global user.name 2>/dev/null)" ]; then
+    ok "git identity: $(git config --global user.name) <$(git config --global user.email)>"
+  else meh "git identity not set (gh-connect asks the first time)"; fi
+
+  if [ "${NOTIFY:-1}" != 1 ]; then meh "desktop notifications are off (NOTIFY=0)"
+  elif [ -n "$WSL_DISTRO_NAME" ] && [ -x /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe ]; then ok "desktop notifications via Windows"
+  elif command -v notify-send >/dev/null; then ok "desktop notifications via notify-send"
+  else meh "no desktop notifier (install libnotify / notify-send); pane labels still work"; fi
+
+  if [ -n "$WSL_DISTRO_NAME" ]; then
+    if [ -e "${WIN_PY:-}" ]; then ok "winpy -> $WIN_PY"; else meh "winpy: Windows Python not found at '${WIN_PY:-}'"; fi
+  elif command -v fc-list >/dev/null; then
+    if fc-list | grep -qi 'MesloLGS NF'; then ok "MesloLGS NF font"; else meh "MesloLGS NF font not found (prompt icons may look off)"; fi
+  fi
+
+  local HLOG="${XDG_STATE_HOME:-$HOME/.local/state}/agent-grid/agent-hook.log"
+  if [ -s "$HLOG" ]; then
+    echo; echo "Recent checks and reviews ($(short "$HLOG")):"
+    tail -n 5 "$HLOG" | sed 's/^/  /'
+  fi
+  echo
+  if [ -s "$LOG" ]; then
+    echo "Recent auto-push activity ($(short "$LOG")):"
+    tail -n 5 "$LOG" | sed 's/^/  /'
+    grep -q 'not a --gh session' <(tail -n 5 "$LOG") && \
+      meh "'not a --gh session' means that Claude wasn't started with spawn --gh."
+  else
+    meh "No auto-push activity yet. After a Claude turn in an [auto-push] pane, run spawn --doctor again to confirm the push worked."
+  fi
+  echo
+  if [ $fails -eq 0 ]; then echo "All good."; else echo "$fails thing(s) to fix."; fi
+  return $fails
+}
+
+# ---- Setting up a folder's checks ---------------------------------
+# The checks are the user's answer key, so the setup agent builds them from the data,
+# last year's certified results, and the RMA, never from the levy code, and ends with
+# a summary the user confirms.
+setup_prompt() {   # $1 = new | existing
+  cat << 'P'
+Set up the agent-grid manager's checks for this levy folder, in .agent-grid/checks.toml.
+
+These checks are the user's independent answer key. Analyst agents write the levy code; the manager tests that code against these checks. So build them only from the data, last year's certified results, and the RMA or other district documents. Never derive a rule or a number from this folder's levy code: if the code is wrong, checks copied from it would be wrong in the same way. You may look at code and config only to learn file names and column layouts. For the same reason, never take a rule or a number from Claude memory notes, past session transcripts, or anything an earlier AI session wrote, and don't write memory notes yourself.
+
+Search only this folder and the folder it sits in. If you can't find a file there, ask the user where it is instead of searching the rest of the computer.
+
+1. Find the roll this folder produces: the parcel-level levy output (.csv or .xlsx) and its columns for the APN and the levy amount, plus max tax, units, rate, and the rate class (zone, land use) if present. Look at existing outputs, any workflows in .agent-grid/workflows/, and config files. If no roll exists yet, choose output/levy_roll.csv with columns APN and Levy, and say so; the analyst's workflow will be required to write it there.
+2. Find last year's certified roll, the final roll that went to the county. Look in prior fiscal-year folders and your levy software's exports. Then find last year's version of every input the levy reads (county export, rates, budget, config).
+3. Run levy-check init if .agent-grid/checks.toml doesn't exist, then fill it in. Turn on a rule only if you can confirm it from the RMA or the data: max_tax only if there is a max tax column, max_tax_is_units_x_rate only if the RMA defines it that way, total only if you find this year's levy requirement in the budget, and parcels_file only if the county export lists every parcel that should be on the roll. Also fill in, where the documents support it:
+   - [max_rates]: each rate class's maximum rate per unit, from the RMA (base rate, base year, escalator, and rounding) or from a district document that states this year's max. levy-check then works out the max itself instead of trusting the roll's own columns. Note the document, page, and section next to each.
+   - unique_by, if a parcel can rightly appear more than once (for example one line per assessment or funding): the columns that together identify one line.
+   - [totals]: expected totals by district or zone, if the budget gives them.
+4. Copy last year's certified roll and last year's inputs into .agent-grid/backtest/, and fill in [backtest] and [backtest.inputs]. Leave backtest.workflow blank unless the folder has more than one workflow. Don't change or add to last year's input files. If last year's levy depended on a decision someone made by hand (a credit, a status typed into a working file), ask the user how next year's run will get that decision. If some parcels can't be reproduced for a real reason, list each one under [backtest.known_differences] with the reason. Never excuse a whole district or zone.
+5. Run levy-check on the most recent accepted roll in the folder. If a rule fails on a roll that was actually certified, do not quietly turn the rule off: either the rule doesn't fit this district or that roll had a real problem. Report it and ask. Never set up a check that requires repeating an amount over the RMA maximum: list those parcels as known differences and tell the user. Then run levy-check selftest.
+6. Only write inside .agent-grid/. Never edit code, inputs, or outputs elsewhere.
+
+How levy-check works, so you don't need to read its source: "levy-check init" writes a commented .agent-grid/checks.toml template (it explains every setting). "levy-check" checks the roll named in [roll] against the rules; it exits 0 if everything passes, 1 if a check fails, and 2 if checks.toml or a file it names can't be used, with the reason. "levy-check selftest" plants errors in copies of the rolls (nothing on disk changes) and reports which checks catch each one. Run it from the folder root. Run one command per Bash call, not several joined with ; or && or |, because single commands like levy-check, ls, and python3 are pre-approved and won't interrupt the user. Use the Read tool to look at text files and python3 with openpyxl for spreadsheets.
+
+Finish with a short summary for the user, in plain language:
+- each check you turned on, and the file (and sheet, row, cell, or page and section) its number or rule came from;
+- what you couldn't find, and what you assumed;
+- any rule that failed on last year's certified roll, and each known difference with its reason;
+- the errors selftest reported as MISSED, in plain words: those are what these checks can't catch;
+- a suggestion to hand-calculate a few parcels, one per rate class, with spawn --spot. Those stay outside the folder, where analysts can't see them.
+Ask only what you can't settle yourself, such as two candidate certified rolls that disagree. When the user confirms, tell them to type /exit to continue.
+P
+  [ -n "${LEVY_SOFTWARE:-}" ] && printf '
+%s
+' "The levy software here is ${LEVY_SOFTWARE}: certified rolls and levy exports come from it."
+  [ "$1" = existing ] && printf '
+%s
+' "There is already a .agent-grid/checks.toml. Review it against the data and documents, complete what's missing, and list every change you make. Don't loosen or remove a check without asking."
+}
+
+setup_checks() {   # $1 = folder
+  local dir state py="$HOME/.venv/bin/python"
+  dir=$(cd "${1:-.}" 2>/dev/null && pwd -P) || die "No such folder: $1"
+  command -v claude >/dev/null || die "Claude Code isn't installed."
+  state=new; [ -f "$dir/.agent-grid/checks.toml" ] && state=existing
+  printf '\033[1;35mSetting up the checks for %s\033[0m\n' "$(basename "$dir")"
+  echo "Claude will find the files, write .agent-grid/checks.toml, and summarize where every number came from."
+  echo "Look over its summary, then type /exit to continue."
+  echo
+  # AGENT_GRID_SETUP: this session isn't an analyst, so the manager never reviews it; the
+  # pane shows "setting up checks", then "checks ready: your turn" when its summary is up.
+  # Auto memory is off: notes from setup would load into every later session here,
+  # the analyst's included.
+  local pane="${TMUX_PANE:-}" rc
+  [ -n "$pane" ] && tmux set -p -t "$pane" @status setup 2>/dev/null && tmux set -p -t "$pane" @status_at "$(date +%H:%M)" 2>/dev/null
+  ( cd "$dir" && AGENT_GRID_SETUP=1 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 claude "$(setup_prompt "$state")" --permission-mode acceptEdits \
+      --allowedTools "Read,Grep,Glob,Bash(levy-check:*),Bash(python3:*),Bash($py:*),Bash(ls:*),Bash(find:*),Bash(head:*),Bash(cat:*),Bash(wc:*),Bash(file:*),Bash(cp:*),Bash(mkdir:*)" ); rc=$?
+  [ -n "$pane" ] && tmux set -pu -t "$pane" @status 2>/dev/null
+  return $rc
+}
+
+# ---- Your hand-calculated parcels ----------------------------------
+# Kept under ~/.config/agent-grid/spot/, outside the folder, so analysts never see the
+# figures and can't tune the code to them. The hook blocks analysts from reading them.
+spot_edit() {   # $1 = folder
+  local dir key f
+  dir=$(cd "${1:-.}" 2>/dev/null && pwd -P) || die "No such folder: $1"
+  key=$(printf '%s' "$dir" | md5sum | cut -c1-12)
+  f="$CONF_DIR/spot/$key.toml"
+  mkdir -p "$CONF_DIR/spot" && chmod 700 "$CONF_DIR/spot"
+  if [ ! -f "$f" ]; then
+    cat > "$f" << EOF
+# Hand-calculated parcels for $(short "$dir")
+# Work a few parcels out yourself from the RMA, one per rate class (each developed class,
+# undeveloped land, anything unusual), and enter the levy you expect for each below.
+# This file lives outside the folder, and agent-grid blocks analysts from reading it.
+# On every test the manager compares the roll with these figures. A mismatch comes to
+# you, not the analyst: either the code or your figure is wrong. Update it every year.
+# (If you move or rename the folder, run spawn --spot there again: this file goes by path.)
+fiscal_year = ""
+tolerance = 0.00
+
+[parcels]
+# "123-456-789" = 1234.56    # Zone 7 single family: 1 unit x 1,234.56 (RMA section 4.2)
+EOF
+    chmod 600 "$f"
+  fi
+  echo "Hand-calculated parcels for $(basename "$dir"): $(short "$f")"
+  "${EDITOR:-nano}" "$f"
+  if [ -f "$dir/.agent-grid/checks.toml" ]; then
+    echo; echo "Against the roll there now:"
+    ( cd "$dir" && "$ROOT/bin/levy-check" spot "$f" ) || true
+  fi
+}
+
+# ---- Watching the manager -----------------------------------------
+# Each review is a fresh Claude that streams what it does to a live log per folder.
+# This follows that log: the current test, then each new one as it starts.
+watch_review() {
+  local dir="$1" key log id
+  command -v jq >/dev/null || die "jq isn't installed."
+  if [ -z "$dir" ]; then
+    if [ -n "$TMUX" ] && tmux show -pqv @agent 2>/dev/null | grep -q 1; then dir=$(tmux display -p '#{pane_current_path}')
+    elif command -v fzf >/dev/null && [ -n "$(agent_lines)" ]; then
+      id=$(agent_lines | fzf --reverse --delimiter=$'\t' --with-nth=2 --header="Watch which agent's manager?" | cut -f1)
+      [ -n "$id" ] || return 0
+      dir=$(tmux display -p -t "$id" '#{pane_current_path}')
+    else dir=.; fi
+  fi
+  dir=$(cd "$dir" 2>/dev/null && pwd -P) || die "No such folder: $dir"
+  key=$(printf '%s' "$dir" | md5sum | cut -c1-12); log="$STATE_DIR/live-$key.log"
+  printf '\033[1;35mWatching the manager for %s\033[0m  (Ctrl+C to stop)\n' "$(basename "$dir")"
+  [ -f "$log" ] || echo "No test yet for this folder. The next one will show up here."
+  touch "$log" 2>/dev/null
+  # One line per thing the manager does: its reasoning, each tool it uses, the first
+  # lines of what came back, and the verdict. Plain lines are the hook's own steps.
+  tail -n +1 -F "$log" 2>/dev/null | jq -Rr --unbuffered '
+    def clip(n): if length > n then .[0:n] + "..." else . end;
+    def first_line: tostring | split("\n") | map(select(length > 0)) | (.[0] // "");
+    def render:
+      if .type == "assistant" then
+        [ .message.content[]? |
+          if .type == "text" then .text
+          elif .type == "tool_use" then
+            "  > " + .name + ": " + ((.input.command // .input.file_path // .input.pattern // .input.path // (.input | tostring)) | first_line | clip(160))
+          else empty end ] | join("\n")
+      elif .type == "user" then
+        [ .message.content[]? | select(.type == "tool_result") |
+          (.content | if type == "array" then map(.text? // "") | join("\n") else tostring end)
+          | split("\n") | map(select(length > 0)) | .[0:3] | map("      " + clip(160)) | join("\n") ] | join("\n")
+      elif .type == "result" then "  (manager done in " + (((.duration_ms // 0) / 1000) | floor | tostring) + "s)"
+      else "" end;
+    . as $line | (try (fromjson | if type == "object" then render else $line end) catch $line) | select(length > 0)'
+}
+
+# ---- Status, overview, and messaging ------------------------------
+status_text() {
+  case "$1" in
+    setup)    echo "setting up checks" ;;
+    setup-ready) echo "CHECKS READY: YOUR TURN" ;;
+    waiting)  echo "NEEDS YOU" ;;
+    failed)   echo "CHECKS FAILED" ;;
+    flagged)  echo "MANAGER FLAGGED" ;;
+    checking) echo "checking" ;;
+    reviewing) echo "manager testing" ;;
+    queued)   echo "queued for Excel" ;;
+    working)  echo "working" ;;
+    done)     echo "done" ;;
+    *)        echo "idle" ;;
+  esac
+}
+status_rank() {
+  case "$1" in waiting|setup-ready) echo 1 ;; failed|flagged) echo 2 ;; done) echo 3 ;; checking|reviewing|queued) echo 4 ;; working|setup) echo 5 ;; *) echo 6 ;; esac
+}
+
+# One line per agent pane: pane_id <tab> display text, most urgent first
+agent_lines() {
+  local id st lbl ap at where sep='|'   # tmux escapes control characters, and | can't appear in Windows folder names
+  tmux list-panes -a -f '#{@agent}' \
+    -F "#{pane_id}${sep}#{@status}${sep}#{?@label,#{@label},#{b:pane_current_path}}${sep}#{@autopush}${sep}#{@status_at}${sep}#{session_name}:#{window_index}" 2>/dev/null \
+  | while IFS="$sep" read -r id st lbl ap at where; do
+    printf '%s\t%s\t%-16s %-30s %-10s %-6s %s\n' "$(status_rank "$st")" "$id" "$(status_text "$st")" \
+        "$lbl" "${ap:+auto-push}" "${at:--}" "$where"
+    done | sort -t $'\t' -k1,1n | cut -f2-
+}
+
+summary() {
+  local w=0 f=0 d=0 r=0 m=0 s out=""
+  while read -r s; do
+    case "$s" in waiting|setup-ready) w=$((w + 1)) ;; failed|flagged) f=$((f + 1)) ;; done) d=$((d + 1)) ;;
+                 working|checking|setup) r=$((r + 1)) ;; reviewing|queued) m=$((m + 1)) ;; esac
+  done < <(tmux list-panes -a -f '#{@agent}' -F '#{@status}' 2>/dev/null)
+  [ $w -gt 0 ] && out+="$w need you  "
+  [ $f -gt 0 ] && out+="$f flagged  "
+  [ $r -gt 0 ] && out+="$r working  "
+  [ $m -gt 0 ] && out+="$m testing  "
+  [ $d -gt 0 ] && out+="$d done  "
+  printf '%s' "$out"
+}
+
+overview() {
+  command -v fzf >/dev/null || die "fzf isn't installed."
+  local lines id
+  lines=$(agent_lines)
+  [ -n "$lines" ] || { echo "No agents running. Start some with spawn."; return 0; }
+  id=$(printf '%s\n' "$lines" | fzf --reverse --height=100% --delimiter=$'\t' --with-nth=2 \
+        --header="Agents (most urgent first). Enter: jump to it | Esc: close" \
+        --preview 'tmux capture-pane -ep -t {1} | grep -v "^[[:space:]]*$" | tail -n 60' \
+        --preview-window=down,60% | cut -f1)
+  [ -n "$id" ] || return 0
+  if [ -n "$TMUX" ]; then tmux switch-client -t "$id"; else tmux select-window -t "$id"; tmux select-pane -t "$id"; tmux attach -t "$id"; fi
+}
+
+# The folders on screen, as the hook's log writes them ("~/levies/oak-hills")
+agent_folders() {
+  local p q
+  tmux list-panes -a -f '#{@agent}' -F '#{pane_current_path}' 2>/dev/null | sort -u | while IFS= read -r p; do
+    q=$(cd "$p" 2>/dev/null && pwd -P) || q="$p"; printf '%s\n' "${q/#$HOME/$TILDE}"
+  done
+}
+# One line per agent for the manager pane: what it's doing, in words, and the last result
+feed_agents() {   # $1 = the hook's log
+  local id st lbl at path q last sep='|'
+  tmux list-panes -a -f '#{@agent}' \
+    -F "#{pane_id}${sep}#{@status}${sep}#{?@label,#{@label},#{b:pane_current_path}}${sep}#{@status_at}${sep}#{pane_current_path}" 2>/dev/null \
+  | while IFS="$sep" read -r id st lbl at path; do
+      q=$(cd "$path" 2>/dev/null && pwd -P) || q="$path"; q="${q/#$HOME/$TILDE}"
+      last=$(grep -F "  $q  " "$1" 2>/dev/null | grep -E '  (manager|verify): ' | grep -v 'manager note:' | tail -n 1 \
+             | awk -F '  ' '{ m = $3; sub(/ See .*/, "", m); sub(/^manager: /, "", m); sub(/^verify: /, "check: ", m); print substr($1, 12, 5) " " m }')
+      printf '%s\t%-24s %-22s %-6s %s\n' "$(status_rank "$st")" "$(status_text "$st")" "$lbl" "${at:--}" "${last:+last: $last}"
+    done | sort -t $'\t' -k1,1n | cut -f2-
+}
+
+manager_feed() {
+  local hlog="$STATE_DIR/agent-hook.log" key latest cols rows frame lines here
+  trap 'tput cnorm 2>/dev/null; exit 0' INT TERM
+  tput civis 2>/dev/null
+  while true; do
+    cols=$(tput cols 2>/dev/null || echo 100); rows=$(tput lines 2>/dev/null || echo 30)
+    latest=$(grep -l 'VERDICT: *FAIL' "$STATE_DIR"/reviews/*.md 2>/dev/null | xargs -r ls -t 2>/dev/null | head -n 1)
+    frame=$(
+      printf '\033[1;35mMANAGER\033[0m  tests each analyst agent'"'"'s workflows and tries to break them\n'
+      printf '\033[2m[o] overview  [r] latest findings  [q] close\033[0m\n\n'
+      printf '\033[1mAgents\033[0m\n'
+      lines=$(feed_agents "$hlog")
+      if [ -n "$lines" ]; then printf '%s\n' "$lines" | sed 's/^/  /'; else echo "  none running yet"; fi
+      # Only the folders on screen: older entries for folders you've closed stay in the log
+      here=$(agent_folders)
+      if [ -s "$STATE_DIR/workflow-results.tsv" ]; then
+        local names; names=$(tmux list-panes -a -f '#{@agent}' -F '#{?@label,#{@label},#{b:pane_current_path}}' 2>/dev/null | sort -u)
+        lines=$(awk -F '\t' 'NR == FNR { keep[$0] = 1; next } ($2 in keep) || !n { printf "  %s  %-20s %-24s %s\n", substr($1, 7), $2, $3, $4 }' \
+                  n="$([ -n "$names" ] && echo 1)" <(printf '%s\n' "$names") "$STATE_DIR/workflow-results.tsv" | tail -n 6)
+        [ -n "$lines" ] && printf '\n\033[1mWorkflow tests\033[0m\n%s\n' "$lines"
+      fi
+      printf '\n\033[1mRecent reviews and checks\033[0m\n'
+      if [ -s "$hlog" ]; then
+        { if [ -n "$here" ]; then grep -F -f <(printf '%s\n' "$here" | sed 's/^/  /; s/$/  /') "$hlog"; else cat "$hlog"; fi; } \
+          | grep -E '  (manager|review|verify): ' | tail -n 6 | awk -F '  ' '{
+            t = substr($1, 12, 5); p = $2; sub(/.*\//, "", p); m = $3
+            sub(/^review: /, "manager: ", m); sub(/^verify: /, "check: ", m); sub(/ See .*/, "", m)
+            printf "  %s  %-20s %s\n", t, p, m }'
+      else echo "  nothing yet"; fi
+      if [ -n "$latest" ]; then
+        printf '\n\033[1mLatest findings\033[0m (%s)\n' "$(head -n 1 "$latest" | sed 's/^# Review of //; s|.*/||')"
+        sed '1,2d' "$latest" | grep -v 'VERDICT:' | grep -v '^[[:space:]]*$' | head -n 12 | sed 's/^/  /'
+      fi
+    )
+    clear
+    # Fit the pane: trim width and height
+    printf '%s\n' "$frame" | cut -c1-"$cols" | head -n $((rows - 1))
+    if read -rsn1 -t 3 key; then
+      case "$key" in
+        o) tput cnorm 2>/dev/null; overview; tput civis 2>/dev/null ;;
+        r) [ -n "$latest" ] && ${PAGER:-less} "$latest" ;;
+        q) break ;;
+      esac
+    fi
+  done
+  tput cnorm 2>/dev/null
+}
+
+send_msg() {
+  local text="$SEND_TEXT" ids id count=0
+  if [ -z "$text" ]; then read -rp "Message for the agents: " text; fi
+  [ -n "$text" ] || { echo "Nothing to send."; return 0; }
+  if [ $SEND_ALL -eq 1 ]; then
+    ids=$(tmux list-panes -a -f '#{@agent}' -F '#{pane_id}' 2>/dev/null)
+  else
+    command -v fzf >/dev/null || die "fzf isn't installed. Use --all to send to every agent."
+    ids=$(agent_lines | fzf --multi --reverse --delimiter=$'\t' --with-nth=2 --bind 'start:select-all' \
+            --header="Send to: Tab toggles, all are selected | Enter: send | Esc: cancel" | cut -f1)
+  fi
+  for id in $ids; do
+    tmux send-keys -t "$id" -l "$text" && tmux send-keys -t "$id" Enter && count=$((count + 1))
+  done
+  echo "Sent to $count agent(s)."
+}
+
+# ---- Options -----------------------------------------------------
+argv=("$@")
+# Pass 1: load a workspace first, so other options can override it
+for ((i = 0; i < ${#argv[@]}; i++)); do
+  case "${argv[$i]}" in
+    -w|--workspace)
+      WS="${argv[$((i + 1))]:-}"; [ -n "$WS" ] || die "-w needs a workspace name"
+      load_ws "$WS" ;;
+  esac
+done
+
+# Pass 2: long options
+args=()
+for ((i = 0; i < ${#argv[@]}; i++)); do
+  a="${argv[$i]}"
+  case "$a" in
+    -w|--workspace) i=$((i + 1)) ;;
+    --gh)        GH=1 ;;
+    --no-gh)     GH=0 ;;
+    --manager|--review)       REVIEW=1 ;;
+    --no-manager|--no-review) REVIEW=0 ;;
+    --manager-feed) manager_feed; exit 0 ;;
+    --close)     CLOSE=1 ;;
+    --prompt)    i=$((i + 1)); PROMPT="${argv[$i]:-}"; [ -n "$PROMPT" ] || die "--prompt needs text" ;;
+    --prompt-file) i=$((i + 1)); PROMPT_FILE="${argv[$i]:-}"; [ -n "$PROMPT_FILE" ] || die "--prompt-file needs a file name" ;;
+    --overview)  overview; exit $? ;;
+    --summary)   summary; exit 0 ;;
+    --all)       SEND_ALL=1 ;;
+    --send)      SEND=1
+                 nxt="${argv[$((i + 1))]:-}"
+                 if [ -n "$nxt" ] && [[ "$nxt" != -* ]]; then SEND_TEXT="$nxt"; i=$((i + 1)); fi ;;
+    --worktrees) i=$((i + 1)); WT="${argv[$i]:-}"
+                 [[ "$WT" =~ ^[1-9][0-9]*$ ]] || die "--worktrees needs a number, e.g. --worktrees 3" ;;
+    --save)      i=$((i + 1)); SAVE="${argv[$i]:-}"
+                 [ -n "$SAVE" ] || die "--save needs a name"; valid_name "$SAVE" ;;
+    --list)      list_ws; exit 0 ;;
+    --forget)    i=$((i + 1)); n="${argv[$i]:-}"; [ -n "$n" ] || die "--forget needs a name"
+                 [ -f "$(ws_file "$n")" ] || die "No workspace '$n'. See: spawn --list"
+                 rm -f "$(ws_file "$n")"; echo "Forgot workspace '$n'."; exit 0 ;;
+    --doctor)    doctor; exit $? ;;
+    --test)      nxt="${argv[$((i + 1))]:-.}"; [[ "$nxt" == -* ]] && nxt=.
+                 [ "$nxt" = . ] || i=$((i + 1))
+                 exec "$ROOT/bin/agent-hook" "$a" "$nxt" ;;
+    --clean)     exec "$ROOT/bin/agent-hook" --clean ;;
+    --setup)     nxt="${argv[$((i + 1))]:-.}"; [[ "$nxt" == -* ]] && nxt=.
+                 setup_checks "$nxt"; exit $? ;;
+    --spot)      nxt="${argv[$((i + 1))]:-.}"; [[ "$nxt" == -* ]] && nxt=.
+                 spot_edit "$nxt"; exit $? ;;
+    --watch)     nxt="${argv[$((i + 1))]:-}"; [[ "$nxt" == -* ]] && nxt=""
+                 watch_review "$nxt"; exit $? ;;
+    --version)   echo "spawn (agent-grid) $(version)"; exit 0 ;;
+    --help)      usage ;;
+    *)           args+=("$a") ;;
+  esac
+done
+set -- "${args[@]}"
+if [ $SEND -eq 1 ]; then send_msg; exit 0; fi
+
+# Short options (-k is accepted for compatibility; keeping the pane is the default)
+while getopts ":gx:b:c:rd:s:tkp:h" opt; do
+  case $opt in
+    g) GH=1 ;;
+    x) SUFFIX="$OPTARG" ;;
+    b) BASE="$OPTARG" ;;
+    c) CMD="$OPTARG" ;;
+    r) CMD="claude --continue || claude" ;;
+    d) DEPTH="$OPTARG" ;;
+    s) SESSION="$OPTARG" ;;
+    t) TABS=1 ;;
+    k) CLOSE=0 ;;
+    p) LABEL="$OPTARG" ;;
+    h) usage ;;
+    \?) die "Unknown option -$OPTARG (try spawn -h)" ;;
+    :)  die "Option -$OPTARG needs a value" ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+BASE="$(cd "$BASE" 2>/dev/null && pwd)" || die "No such directory: $BASE"
+command -v tmux >/dev/null || die "tmux isn't installed."
+
+# ---- Picker ------------------------------------------------------
+pick() {
+  command -v fzf >/dev/null || die "fzf isn't installed. Pass folders as arguments instead."
+  local DONE="[ Done: launch selected ]" sel picks p finished head="Base: $BASE"
+  [ $GH -eq 1 ] && head="$head   (GitHub mode: auto-push on)"
+  [ $REVIEW -eq 0 ] && head="$head   (no manager)"
+  [ -n "$SAVE" ] && head="$head   (saving as '$SAVE'; pick nothing to save just the base)"
+  while true; do
+    if [ ${#FOLDERS[@]} -eq 0 ]; then
+      sel="none yet"
+    else
+      sel=$(printf '%s, ' "${FOLDERS[@]}"); sel=${sel%, }
+    fi
+
+    picks=$( { echo "$DONE"; echo "."
+               cd "$BASE" && find . -mindepth 1 -maxdepth "$DEPTH" \
+                 \( -name '.*' -o -name '__pycache__' -o -name 'node_modules' \
+                    -o -name 'venv' -o -iname 'archive' \) -prune -o -type d -print \
+               | sed 's|^\./||' | sort; } \
+             | grep -vxF -f <(printf '%s\n' "${FOLDERS[@]}") \
+             | fzf --multi --reverse --height=70% \
+                   --prompt="$LABEL > " \
+                   --header="$head
+Enter: add | Tab: mark several | Esc or Done: launch
+Selected: $sel" \
+                   --preview "cd '$BASE'/{} 2>/dev/null && { git status -sb 2>/dev/null | head -1; ls -1; }")
+
+    [ -z "$picks" ] && break
+    finished=0
+    while IFS= read -r p; do
+      if [ "$p" = "$DONE" ]; then finished=1; else FOLDERS+=("$p"); fi
+    done <<< "$picks"
+    [ $finished -eq 1 ] && break
+  done
+}
+
+# ---- What to open ------------------------------------------------
+DIRS=(); CMDS=(); LABELS=()
+
+if [ "$WT" -gt 0 ]; then
+  target="$BASE"
+  if [ $# -gt 0 ]; then
+    case "$1" in /*) target="$1" ;; .) ;; *) target="$BASE/$1" ;; esac
+  fi
+  target="$(cd "$target" 2>/dev/null && pwd)" || die "No such directory: $target"
+  git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "--worktrees needs a git repo, and $(short "$target") isn't one."
+  target="$(git -C "$target" rev-parse --show-toplevel)"
+  [ "$CMD" = claude ] || warn "--worktrees always runs claude --worktree, so -c/-r are ignored."
+  FOLDERS=("$target")
+  repo="$(basename "$target")"
+  for ((k = 1; k <= WT; k++)); do
+    DIRS+=("$target"); CMDS+=("claude --worktree agent-$k"); LABELS+=("$repo: agent-$k")
+  done
+else
+  if [ $# -gt 0 ]; then FOLDERS=("$@")
+  elif [ ${#WS_FOLDERS[@]} -gt 0 ]; then FOLDERS=("${WS_FOLDERS[@]}")
+  else pick
+  fi
+fi
+
+if [ -n "$SAVE" ]; then
+  save_ws "$SAVE"
+  if [ ${#FOLDERS[@]} -eq 0 ]; then
+    echo "No folders picked, so it opens the picker under $(short "$BASE")."
+    exit 0
+  fi
+fi
+[ ${#FOLDERS[@]} -eq 0 ] && { echo "Nothing selected."; exit 0; }
+
+if [ "$WT" -eq 0 ]; then
+  for d in "${FOLDERS[@]}"; do
+    case "$d" in
+      .)  dir="$BASE" ;;
+      /*) dir="$d" ;;
+      *)  dir="$BASE/$d" ;;
+    esac
+    if [ -d "$dir" ]; then DIRS+=("$dir"); CMDS+=("$CMD"); LABELS+=(""); else echo "not found: $dir"; fi
+  done
+fi
+[ ${#DIRS[@]} -eq 0 ] && exit 1
+
+# ---- Starting prompts ----------------------------------------------
+if [ -n "$PROMPT" ] || [ -n "$PROMPT_FILE" ]; then
+  if [ "$WT" -eq 0 ] && [ "$CMD" != claude ]; then
+    warn "--prompt starts a fresh claude in each pane, so -c/-r are ignored."
+  fi
+  for k in "${!DIRS[@]}"; do
+    dir="${DIRS[$k]}"
+    [ "$WT" -eq 0 ] && CMDS[k]="claude"
+    if [ -n "$PROMPT" ]; then
+      CMDS[k]="${CMDS[$k]} $(sq "$PROMPT")"
+    elif [[ "$PROMPT_FILE" == /* ]] && [ -f "$PROMPT_FILE" ]; then
+      CMDS[k]="${CMDS[$k]} \"\$(cat $(printf '%q' "$PROMPT_FILE"))\""
+    elif [ -f "$dir/$PROMPT_FILE" ]; then
+      CMDS[k]="${CMDS[$k]} \"\$(cat $(printf '%q' "$PROMPT_FILE"))\""
+    elif [ -f "$ORIG_PWD/$PROMPT_FILE" ]; then
+      CMDS[k]="${CMDS[$k]} \"\$(cat $(printf '%q' "$ORIG_PWD/$PROMPT_FILE"))\""
+    else
+      warn "No $PROMPT_FILE for $(basename "$dir"), so it starts without a prompt."
+    fi
+  done
+fi
+
+# ---- Checks: offer to set them up before the analyst starts --------
+if [ $REVIEW -eq 1 ] && [ -t 0 ]; then
+  declare -A offered=()
+  for k in "${!DIRS[@]}"; do
+    dir="${DIRS[$k]}"; cmd="${CMDS[$k]}"
+    [[ "$cmd" == *claude* ]] || continue
+    [ -f "$dir/.agent-grid/checks.toml" ] || [ -f "$dir/.agent-grid/no-checks" ] && continue
+    [ -n "${offered[$dir]:-}" ] && continue; offered[$dir]=1
+    read -rp "$(basename "$dir") has no checks for the manager yet. Have Claude set them up first? [Y/n/never] " yn
+    case "$yn" in
+      [Nn][Ee][Vv]*) mkdir -p "$dir/.agent-grid" && touch "$dir/.agent-grid/no-checks"
+                     echo "  Won't ask again for $(basename "$dir"). Run spawn --setup there any time." ;;
+      [Nn]*) ;;
+      *) CMDS[k]="spawn --setup .; ${cmd}" ;;
+    esac
+  done
+fi
+
+# ---- GitHub mode -------------------------------------------------
+if [ $GH -eq 1 ]; then
+  command -v gh >/dev/null || die "spawn --gh needs the GitHub CLI (gh). Install it, then retry."
+  command -v gh-connect >/dev/null || die "gh-connect is missing. Re-run agent-grid's install.sh."
+  gh auth status >/dev/null 2>&1 || gh auth login || exit 1
+
+  declare -A seen=()
+  for dir in "${DIRS[@]}"; do
+    [ -n "${seen[$dir]:-}" ] && continue; seen[$dir]=1
+    name="$(basename "$dir")"
+    if git -C "$dir" remote get-url origin >/dev/null 2>&1; then
+      echo "connected: $name -> $(git -C "$dir" remote get-url origin)"
+    else
+      echo; echo "== $name isn't connected to GitHub yet"
+      ( cd "$dir" && gh-connect ${SUFFIX:+-x "$SUFFIX"} ) || true
+      git -C "$dir" remote get-url origin >/dev/null 2>&1 \
+        || warn "$name isn't connected, so it won't auto-push this session."
+    fi
+  done
+fi
+
+# ---- Launch ------------------------------------------------------
+prefix=""
+[ $GH -eq 1 ] && prefix="export AGENT_GRID_AUTOPUSH=1; "
+[ $REVIEW -eq 1 ] && prefix="${prefix}export AGENT_GRID_REVIEW=1; "
+# Claude's own memory notes load into every later session in a folder; ANALYST_AUTO_MEMORY=0
+# turns them off for analysts too (setup and the manager never use them)
+[ "${ANALYST_AUTO_MEMORY:-1}" = 0 ] && prefix="${prefix}export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1; "
+
+tmux has-session -t "=$SESSION" 2>/dev/null && new=0 || new=1
+
+# The manager: one "manager" pane per session, whenever the agents run Claude
+uses_claude=0
+for c in "${CMDS[@]}"; do [[ "$c" == *claude* ]] && uses_claude=1; done
+[ $uses_claude -eq 0 ] && REVIEW=0
+if [ $REVIEW -eq 1 ]; then
+  mid=""
+  if [ $new -eq 1 ]; then
+    mid=$(tmux new-session -d -P -F '#{pane_id}' -s "$SESSION" -n manager -c "$BASE")
+    new=0
+  elif [ -z "$(tmux list-panes -s -t "=$SESSION" -f '#{@manager}' -F '#{pane_id}' 2>/dev/null)" ]; then
+    if [ $TABS -eq 1 ]; then
+      mid=$(tmux new-window -P -F '#{pane_id}' -t "$SESSION:" -n manager -c "$BASE")
+    else
+      mid=$(tmux split-window -P -F '#{pane_id}' -t "$SESSION:" -c "$BASE")
+    fi
+  fi
+  if [ -n "$mid" ]; then
+    tmux set -p -t "$mid" @manager 1 2>/dev/null
+    tmux set -p -t "$mid" @label manager 2>/dev/null
+    tmux send-keys -t "$mid" "spawn --manager-feed" Enter
+  fi
+fi
+
+for k in "${!DIRS[@]}"; do
+  dir="${DIRS[$k]}"; cmd="${CMDS[$k]}"; label="${LABELS[$k]}"
+  name="${label:-$(basename "$dir")}"
+
+  if [ $new -eq 1 ]; then
+    id=$(tmux new-session -d -P -F '#{pane_id}' -s "$SESSION" -n "$name" -c "$dir")
+    new=0
+  elif [ $TABS -eq 1 ]; then
+    id=$(tmux new-window -P -F '#{pane_id}' -t "$SESSION:" -n "$name" -c "$dir")
+  else
+    id=$(tmux split-window -P -F '#{pane_id}' -t "$SESSION:" -c "$dir")
+    tmux select-layout -t "$SESSION:" tiled >/dev/null
+  fi
+  tmux set -p -t "$id" @agent 1 2>/dev/null
+  [ $GH -eq 1 ] && tmux set -p -t "$id" @autopush 1 2>/dev/null
+  [ $REVIEW -eq 1 ] && tmux set -p -t "$id" @review 1 2>/dev/null
+  [ -n "$label" ] && tmux set -p -t "$id" @label "$label" 2>/dev/null
+
+  if [ -n "$cmd" ]; then
+    if [ $CLOSE -eq 1 ]; then run="(${prefix}${cmd}) && exit"; else run="${prefix}${cmd}"; fi
+    tmux send-keys -t "$id" "$run" Enter
+  elif [ -n "$prefix" ]; then
+    tmux send-keys -t "$id" "${prefix%; }" Enter
+  fi
+done
+
+if [ -n "$TMUX" ]; then tmux switch-client -t "$SESSION"; else tmux attach -t "$SESSION"; fi

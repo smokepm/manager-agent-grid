@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# winpy (WSL only): run Windows Python, for scripts that drive Excel
+# (win32com, xlwings). Use relative paths, or convert with: wslpath -w
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/agent-grid/config"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+[ -n "$WIN_PY" ] && [ -e "$WIN_PY" ] || {
+  echo "Windows Python not found: '${WIN_PY}'. Set WIN_PY in $CONF"; exit 1; }
+exec "$WIN_PY" "$@"

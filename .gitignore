@@ -1,0 +1,11 @@
+*.bak.*
+.DS_Store
+# agent-grid is code only: client data never belongs here
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+*.pdf
+*.docx
+.agent-grid/
+__pycache__/

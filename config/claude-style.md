@@ -1,0 +1,3 @@
+- Keep responses short and in plain language.
+- Lead with the answer or decision needed, then details.
+- No em dashes.

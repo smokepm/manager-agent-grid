@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# gh-connect: link the current folder to a GitHub repo, so the auto-commit hook
+# pushes code changes after every Claude turn.
+#
+# Usage: gh-connect [-o OWNER] [-x SUFFIX] [repo-name]
+#   no repo-name   pick from OWNER's repos (pre-filtered by folder name) or create new
+#   -o OWNER       GitHub org or user (default: GH_ORG in config, else your account)
+#   -x SUFFIX      suggest "<folder>-SUFFIX" for new repos
+#
+# Connecting to an existing repo never changes your files; it shows what differs.
+# New repos are private. Only code files are staged (CODE_EXT in config).
+set -e
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/agent-grid/config"
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+OWNER="${GH_ORG:-}"; SUFFIX=""; EXT="${CODE_EXT:-py|md|toml|ts|tsx|js|jsx|sh|sql|r|R|go|rs}"
+
+while getopts ":o:x:h" opt; do
+  case $opt in
+    o) OWNER="$OPTARG" ;;
+    x) SUFFIX="$OPTARG" ;;
+    h) awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$0"; exit 0 ;;
+    *) echo "Usage: gh-connect [-o OWNER] [-x SUFFIX] [repo-name]"; exit 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+command -v gh >/dev/null || { echo "Install the GitHub CLI (gh) first."; exit 1; }
+gh auth status >/dev/null 2>&1 || gh auth login
+[ -n "$(git config --global user.name || true)" ] || { read -rp "Git name for commits: " v; git config --global user.name "$v"; }
+[ -n "$(git config --global user.email || true)" ] || { read -rp "Git email for commits: " v; git config --global user.email "$v"; }
+[ -n "$OWNER" ] || OWNER=$(gh api user -q .login)
+
+if git remote get-url origin >/dev/null 2>&1; then
+  echo "Already connected: $(git remote get-url origin)"; exit 0
+fi
+
+folder=$(basename "$PWD" | tr '[:upper:]' '[:lower:]')
+slug=$(echo "$folder" | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')
+default="$slug${SUFFIX:+-$SUFFIX}"
+
+if [ -n "$1" ]; then
+  name="$1"
+else
+  NEW="[ Create new: $default ]"
+  name=$( { echo "$NEW"; gh repo list "$OWNER" --limit 1000 --json name -q '.[].name'; } \
+    | fzf --reverse --height=50% --query "$folder" --prompt="repo > " \
+          --header="Pick the existing $OWNER repo for this folder, or create a new one")
+  [ -z "$name" ] && { echo "Cancelled."; exit 0; }
+  [ "$name" = "$NEW" ] && name="$default"
+fi
+
+[ -d .git ] || git init -q
+
+write_gitignore() {
+  cat > .gitignore << 'IGN'
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+*.pdf
+*.docx
+__pycache__/
+Archive/
+.claude/settings.local.json
+.claude/worktrees/
+IGN
+  echo "Added .gitignore (data files, Archive, and __pycache__ stay off GitHub)."
+}
+
+stage_code() {
+  git add .gitignore 2>/dev/null || true
+  git ls-files -o --exclude-standard | grep -E "\.($EXT)$" | xargs -r -d '\n' git add --
+}
+
+if gh repo view "$OWNER/$name" >/dev/null 2>&1; then
+  echo "Connecting to existing $OWNER/$name..."
+  git remote add origin "https://github.com/$OWNER/$name.git"
+  git fetch -q origin
+  branch=$(git remote show origin | sed -n 's/.*HEAD branch: //p')
+  if [ -z "$branch" ] || [ "$branch" = "(unknown)" ]; then
+    [ -f .gitignore ] || write_gitignore
+    stage_code
+    git diff --cached --quiet || git commit -qm "Initial commit"
+    git push -qu origin HEAD
+  else
+    git reset -q "origin/$branch"
+    git branch -M "$branch"
+    git branch -u "origin/$branch" >/dev/null
+    [ -f .gitignore ] || git checkout -q "origin/$branch" -- .gitignore 2>/dev/null || true
+    [ -f .gitignore ] || write_gitignore
+  fi
+  echo "Connected. Differences between your files and GitHub:"
+  git status --short -- . ':!*.xlsx' ':!*.xlsm' ':!*.xls' ':!*.csv' ':!*.pdf' ':!*.docx'
+  echo "The next Claude turn here pushes code changes in this list. Review it first."
+  exit 0
+fi
+
+[ -f .gitignore ] || write_gitignore
+stage_code
+git diff --cached --quiet || git commit -qm "Initial commit"
+echo "Creating $OWNER/$name (private)..."
+gh repo create "$OWNER/$name" --private --source=. --push
