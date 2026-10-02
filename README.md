@@ -20,7 +20,7 @@ spawn --doctor        check that everything is set up
 - **Workspaces**: save a base folder, folder selection, and options under a name, and reopen them with one command.
 - **Status and notifications**: every pane shows **[working]**, **[needs you]**, **[done]**, or **[checks failed]**, the status bar counts them, and you get a desktop notification when an agent finishes or needs you.
 - **Self-verification**: put a check script in a folder's `.agent-grid/verify.sh`, and Claude can't finish a turn until it passes. Failures go back to Claude to fix, automatically.
-- **A manager with every launch**: analysts write a workflow for each process their code runs. When one finishes, the manager runs every workflow in a contained copy of the folder, runs your own checks and a backtest against last year's certified roll, then a second Claude tries to refute or break the work. Real problems go back to the analyst, and nothing is pushed until the work survives.
+- **A manager with every launch**: analysts write a workflow for each process their code runs. When one finishes, the manager runs every workflow in a contained copy of the folder, runs your own checks (your tests, known-good outputs, and hidden checks only you can see), then a second Claude tries to refute or break the work. Real problems go back to the analyst, and nothing is pushed until the work survives.
 - **Orchestration**: start every agent on the same prompt or on each folder's own `TASK.md`, message all agents at once, and see everything in one overview with live previews.
 - **Doctor**: one command that checks the whole setup and shows recent auto-push activity.
 - **Environment**: zsh with oh-my-zsh and Powerlevel10k, a themed tmux with handy key bindings, a Python venv (pandas, openpyxl, jupyter), Claude Code, the GitHub CLI, a Nerd Font, and VS Code terminal settings.
@@ -90,11 +90,12 @@ The first `spawn --gh` walks you through `gh auth login` if you haven't done it.
 | `spawn --overview` | All agents, most urgent first, with a live preview; Enter jumps there |
 | `spawn --test [DIR]` | Run the manager's test on a folder now |
 | `spawn --watch [DIR]` | Follow the manager's reviews of a folder live |
-| `spawn --spot [DIR]` | Your hand-calculated parcels for a folder, kept outside it |
+| `spawn --spot [DIR]` | Levy folders: your hand-calculated parcels, kept outside the folder |
 | `spawn --setup [DIR]` | Have Claude set up a folder's checks, with a summary for you to confirm |
-| `levy-check selftest` | Plant errors in copies of the rolls and see which checks catch them |
-| `levy-check init` | Start a folder's `checks.toml` by hand |
-| `levy-check` | Run a folder's rules on its current roll |
+| `spawn --hidden [DIR]` | Your hidden checks for a folder, kept outside it |
+| `agent-check init` | Start a folder's `checks.toml` by hand |
+| `agent-check` | Run a folder's check commands yourself |
+| `levy-check selftest` | Levy folders: plant errors in copies of the rolls and see which checks catch them |
 | `spawn --clean` | Delete every test copy |
 | `spawn --send "text"` | Message running agents (pick which, or `--all`) |
 | `spawn -h` | All options |
@@ -180,19 +181,19 @@ Each review is done by a fresh Claude, started when an analyst finishes a turn t
 
 #### Workflows: the analyst's hand-off
 
-A workflow is a repeatable run the manager can execute, for example one levy run. The analyst writes one for each process its code runs:
+A workflow is a repeatable run the manager can execute: a build, a test run, a report, a data run. The analyst writes one for each process its code runs:
 
 ```
-.agent-grid/workflows/levy-run/
+.agent-grid/workflows/report/
   run.sh        the exact commands that produce the outputs, using paths relative to the folder
   WORKFLOW.md   Purpose, Inputs, Outputs, Correct means, Edge cases
 ```
 
 Analysts are told about this at the start of each managed session. Changing code without a workflow sends the turn back.
 
-#### Your checks: rules and a backtest
+#### Your checks: the answer key
 
-The analyst writes "Correct means," so on its own it can share the analyst's misunderstandings. Your checks are the independent part, and they're plain code, so they're exact and never raise false alarms.
+The analyst writes "Correct means," so on its own it can share the analyst's misunderstandings. Your checks are the independent part: they come from you, a spec, or known-good results, never from the code being tested. They live in `.agent-grid/checks.toml`.
 
 You don't have to write them by hand. When you launch a folder that has no checks, `spawn` asks:
 
@@ -200,13 +201,44 @@ You don't have to write them by hand. When you launch a folder that has no check
 oak-hills has no checks for the manager yet. Have Claude set them up first? [Y/n/never]
 ```
 
-Say yes, and before the analyst starts, a setup Claude finds the roll and its columns, last year's certified roll, and last year's inputs. It writes `checks.toml`, copies the backtest files in, runs `levy-check` to confirm everything reads, and runs `levy-check selftest` to see what the checks can't catch. While it works the pane shows **[setting up checks]**; when its summary is up, **[checks ready: your turn]**. The summary lists each check and where its number came from (file, sheet, cell, or RMA page and section), anything it couldn't find or had to assume, each known difference, and what selftest found the checks miss. Look that over, correct anything it got wrong, and type `/exit`. The analyst then starts in the same pane. Run `spawn --setup ~/levies/oak-hills` any time to set up or review a folder's checks; "never" stops the question for that folder.
+Say yes, and before the analyst starts, a setup Claude works out what "correct" means for the folder from independent sources: tests you wrote, a spec or requirements document, known-good outputs from a past release or an earlier checked run, and documents that state the rules. It writes `checks.toml`, runs the checks to confirm they pass, and ends with a summary: each check and where it came from, what's protected, anything it couldn't find or had to assume, and what the checks can't catch. While it works the pane shows **[setting up checks]**; when its summary is up, **[checks ready: your turn]**. Look it over, correct anything it got wrong, and type `/exit`. The analyst then starts in the same pane. Run `spawn --setup ~/projects/oak-hills` any time to set up or review a folder's checks; "never" stops the question for that folder.
 
-The setup Claude is told to build the checks only from the data, last year's certified results, and the RMA: never from the levy code, and never from Claude memory notes or earlier sessions, since either could carry the code's mistakes. It runs with Claude's auto memory off, so nothing it learns leaks into the analyst's sessions. It searches only the folder and the one it sits in, and asks you for anything it can't find there. Its summary is worth your one look: if it picks the wrong certified roll, everything after trusts it.
+The setup Claude is told never to take a rule or an expected value from the code being tested, or from Claude memory notes or earlier sessions, since any of those could carry the code's mistakes. It runs with Claude's auto memory off, so nothing it learns leaks into the analyst's sessions. It searches only the folder and the one it sits in, and asks you for anything it can't find there. Its summary is worth your one look: everything after trusts it.
 
-To write them by hand instead, `levy-check init` creates a commented `checks.toml` to fill in.
+To write them by hand instead, `agent-check init` creates a commented `checks.toml`:
 
-`checks.toml` has these parts:
+```toml
+protect = ["tests/", "SPEC.md"]          # yours: analysts can read and run these, never change them
+
+[[check]]                                # commands that must pass, after the workflows run
+name = "unit tests"
+run = "python3 -m pytest -q tests/"
+
+[[golden]]                               # known inputs, known-good outputs
+name = "March sample"
+inputs = { "data/input.csv" = ".agent-grid/golden/march/input.csv" }
+expect = { "out/report.csv" = ".agent-grid/golden/march/report.csv" }
+```
+
+- **Protected paths:** your own tests, fixtures, and specs. Coding agents are known to "fix" a failing test by editing the test; here they can't. `checks.toml`, `.agent-grid/golden/`, `.agent-grid/backtest/`, and `review.md` are always protected.
+- **Check commands:** anything that exits 0 when the work is right: a test suite, a validator, a script that re-adds a total. They run from the folder root in the test copy, after the workflows.
+- **Golden tests:** the workflow runs in its own copy with the known inputs swapped in, and each output must match its known-good version exactly. Text files ignore Windows line endings, and `.xlsx` files compare cell values. Where exact is too strict (timestamps, ordering), `compare` names a command that decides instead.
+
+Your files are read-only to analysts: agent-grid blocks their edits to them, and blocks shell commands that would change them. Analysts can still read and run them, because seeing what fails is how they fix the code. They're also told that if a check looks wrong, they should stop and say so rather than change the code to fit it. A script that writes there anyway is caught at the next test: the result says your files changed and you're notified. Your files are never auto-pushed to GitHub. A folder without `checks.toml` still gets tested, but every pass says only the analyst's own criteria were used. Run `agent-check` in the folder any time to run your check commands yourself.
+
+**Your hidden checks.** Write a few checks of your own with `spawn --hidden ~/projects/oak-hills`: scripts that exit 0 when the work is right, using cases you worked out yourself. They're kept in `~/.config/agent-grid/hidden/`, outside the folder, and agent-grid blocks analysts from reading them, so the code can't be tuned to them. They run on every test, and a failure comes to you, not the analyst, because either the code or your check is wrong. The files go by the folder's path, so run `spawn --hidden` again after moving a folder. (The block stops the obvious ways of reading them; treat it as a strong deterrent, not a vault.)
+
+What checks can't cover is behavior no test or known-good example reaches: a new kind of input, a changed rule. That's the manager's main target, and your own review is still the last check.
+
+#### Domain packs
+
+Some kinds of projects have their own notion of "correct." A domain pack is a short file of extra setup steps for one kind; setup reads them all and follows the one that fits the folder. agent-grid ships one, `domains/levy.md`, for special-tax and assessment levy rolls. Add your own as `~/.config/agent-grid/domains/<name>.md`: a title, a "Use when:" line, and the steps.
+
+#### Levy folders
+
+For a parcel-level levy roll, setup uses `levy-check`, which knows levy rolls: last year's certified roll, the RMA's maximum rates, and the county's parcel list. It finds the roll and its columns, last year's certified roll and inputs, copies the backtest files in, and runs `levy-check selftest` to see what the checks can't catch. Its summary also lists each known difference and where each number came from (file, sheet, cell, or RMA page and section). Set `LEVY_SOFTWARE` in your config to name the software your certified rolls come from.
+
+A levy folder's `checks.toml` (from `levy-check init`, or from setup) has these parts:
 
 - **The roll:** which file the workflow writes (.csv or .xlsx) and which columns hold the APN, the levy, and optionally the max tax, units, and rate.
 - **Rules every roll must meet:** each APN once (or, where a parcel can rightly appear more than once, each line once by `unique_by`, e.g. APN + account); no blank APNs, negatives, or fractions of a cent; no levy above the max tax; max tax equals units × rate (rounded half up by default); the total ties to this year's levy requirement; every parcel in the county export is on the roll and nothing else is.
@@ -230,13 +262,11 @@ The backtest uses the folder's workflow automatically, and starts once the analy
 
 On every test, the rules run on this year's output. The backtest then puts last year's inputs in place in a separate copy, runs the workflow, and compares the result with the certified roll parcel by parcel, to the cent. Because `levy_core.py` is shared, a change made for one district that breaks another shows up in that district's backtest the same turn. APNs match with or without dashes, and `$1,203.44`-style amounts are read as numbers. Run `levy-check` in the folder yourself any time to see the rule results.
 
-`checks.toml`, `.agent-grid/backtest/`, and `review.md` are yours, and read-only to analysts: agent-grid blocks their edits to them, and blocks shell commands that would change them. Analysts can still read them, because seeing which parcels fail is how they fix the code. They're also told that if a check looks wrong, they should stop and say so rather than change the code to fit it. A script that writes there anyway is caught at the next test: the result says your files changed and you're notified. They're never auto-pushed to GitHub. A folder without `checks.toml` still gets tested, but every pass says only the analyst's own criteria were used.
-
 **Test the tests.** `levy-check selftest` plants errors in copies of the rolls (nothing on disk changes): a parcel dropped, billed twice, or added from outside the district; one levy 10% high; every levy 2% high, as when an escalator is applied twice; a fraction of a cent; a negative levy; a blank APN; a parcel a cent over its max; a parcel in the wrong rate class; and, in the backtest, a parcel off by a cent, dropped, or added. It reports which checks caught each one and which got through. What gets through is the gap your review and the manager have to cover.
 
-**Your hand-calculated parcels.** Work a few parcels out yourself from the RMA, one per rate class, and save them with `spawn --spot ~/levies/oak-hills`. They're kept in `~/.config/agent-grid/spot/`, outside the folder, and agent-grid blocks analysts from reading them, so the code can't be tuned to them. On every test the manager compares the roll with them. A mismatch comes to you, not the analyst, because either the code or your figure is wrong. Update them each fiscal year; the file goes by the folder's path, so run `spawn --spot` again after moving a folder.
+**Your hand-calculated parcels.** The levy form of a hidden check: work a few parcels out yourself from the RMA, one per rate class, and save them with `spawn --spot ~/levies/oak-hills`. On every test the manager compares the roll with them, and a mismatch comes to you. Update them each fiscal year.
 
-What checks can't cover is anything new this year: a new zone, an escalator, annexed or split parcels. Last year can't vouch for those. Max rates and your hand-calculated parcels cover part of it; the manager aims at the rest, and your review of the final roll is still the last check.
+For a levy roll, what checks can't cover is anything new this year: a new zone, annexed or split parcels. Last year can't vouch for those. Max rates and your hand-calculated parcels cover part of it; the manager aims at the rest.
 
 #### What happens when an analyst finishes a turn
 
@@ -248,20 +278,20 @@ What checks can't cover is anything new this year: a new zone, an escalator, ann
    Problems go back to the analyst.
 3. **Snapshot.** The folder is copied as it is right now. Folders on a Windows drive under WSL get their copy on the Windows side, so `winpy` and Excel can open the files.
 4. **The analyst waits.** The pane shows **[manager testing]** until the verdict. Your other analysts keep working.
-5. **Baseline.** Each `run.sh` runs once, exactly as written. Any roll left over from the analyst's own runs is removed first, so a workflow that stops writing its roll can't pass on a stale copy. A failure goes straight back with the error.
-6. **Your checks and the backtest.** If either fails, it goes straight back to the analyst with the failing parcels, without spending a manager review. If `checks.toml` itself is unusable (a column renamed, a file missing), it comes to you instead.
-7. **Your hand-calculated parcels**, if you've saved any with `spawn --spot`. A mismatch comes to you; the analyst isn't told.
+5. **Baseline.** Each `run.sh` runs once, exactly as written. Outputs your checks read (a golden test's expected outputs, a levy roll) are removed first, so a workflow that stops writing one can't pass on a stale copy. A failure goes straight back with the error.
+6. **Your checks.** Your check commands on this run's outputs, then each golden test in its own copy (and in a levy folder, the roll rules and the backtest). If any fails, it goes straight back to the analyst with what failed, without spending a manager review. If `checks.toml` itself is unusable (a missing file, a renamed column), it comes to you instead.
+7. **Your hidden checks**, if you've written any with `spawn --hidden` (or `spawn --spot` in a levy folder). A failure comes to you; the analyst isn't told.
 8. **Refute or break it.** The manager, a second Claude, works in the copy with full tools:
    - checks the outputs against "Correct means" and your `review.md`, by computing rather than reading the code;
    - goes after what your checks can't see: anything new this year, and rules in the code they don't test;
-   - feeds in altered inputs (duplicates, blanks, zero and negative amounts, values at and over limits, missing columns) and runs `levy-check` on the results, so your rules judge its attacks too;
+   - feeds in altered inputs (duplicates, blanks, zero and negative amounts, values at and over limits, missing columns) and runs `agent-check` on the results, so your checks judge its attacks too;
    - reruns to confirm the results don't change, and reads the changed code for wrong rules.
 9. **Verdict.**
    - Each round's findings and the analyst's reply to them are kept as a record. The next review gets that record and is told to verify each earlier finding is really fixed, and to raise a disputed one again only with new evidence that answers the analyst's argument. A pass clears the record.
    - Problems go straight back to the analyst, which picks up where it left off.
    - After `REVIEW_MAX` rounds (default 2), the pane shows **[manager flagged]** and you're notified.
    - A test that can't finish, from a timeout for example, is also flagged, never passed.
-   - A pass is logged with what it covered, e.g. "passed: ran 1 workflow(s) in a copy; your checks passed; backtest passed; your hand-calculated parcels matched; the manager found nothing". If something was missing, like a backtest, the line says so.
+   - A pass is logged with what it covered, e.g. "passed: ran 1 workflow(s) in a copy; your 2 check command(s) passed; 1 golden test(s) matched; your 1 hidden check(s) passed; the manager found nothing". If something was missing, like a backtest, the line says so.
 10. **Push.** With `--gh`, only a version that passed is pushed. If you edit a file by hand while a test runs, that edit isn't pushed until the next test has covered it.
 
 A change to your checks or backtest files triggers a new test even if no code changed. In a folder with no workflows, code changes send the turn back for one. If the analyst then stops without changing anything, it comes straight to you with its reply, instead of being asked again. Where no code changed, the manager reads the changed text files (notes, configs), logged as "read-only review ... nothing was run". If only data or output files changed, it logs "nothing to review" rather than calling that a pass.
@@ -414,7 +444,7 @@ Start with `spawn --doctor`. It names the problem and the fix for most of these.
 | "couldn't finish testing" | Raise `TEST_TIMEOUT` or `WORKFLOW_TIMEOUT`, or split a long run into smaller workflows |
 | "Your checks ... changed since the last test" and you didn't change them | An analyst edited them. Restore your copy (or `git checkout .agent-grid/checks.toml`) and tell the analyst |
 | The backtest fails but last year's numbers are right | Something the workflow reads changed this year and isn't swapped in. Add last year's version under `[backtest.inputs]` |
-| "checks.toml can't be used" | Run `levy-check` in the folder to see why (often a renamed column) |
+| "checks.toml can't be used" | Run `agent-check plan` (or `levy-check`, in a levy folder) in the folder to see why: often a renamed column or a missing file |
 | A rule flags blank amounts on an .xlsx roll | The workbook was written by a script and never calculated. Have the workflow write values, or save it in Excel |
 | Doctor says bubblewrap can't run (Ubuntu 24.04+) | `echo 'kernel.apparmor_restrict_unprivileged_userns=0' \| sudo tee /etc/sysctl.d/60-agent-grid.conf && sudo sysctl --system`, or `CONTAIN=0` |
 | `winpy` workflows fail only under the manager | Run `spawn --doctor`. If Windows programs don't start inside containment, set `CONTAIN=0` |

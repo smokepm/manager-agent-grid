@@ -5,15 +5,17 @@
 # Hook events:
 #   - marks the tmux pane: setting up checks / checks ready for you / working / needs you /
 #     checking / manager testing / queued for Excel / done / checks failed / manager flagged
-#   - PreToolUse, in analyst sessions: blocks edits to your checks, backtest, and review.md,
-#     and any look at your hand-calculated parcels (spawn --spot)
+#   - PreToolUse, in analyst sessions: blocks edits to your checks and the files they name
+#     (protected tests, golden and backtest files, review.md), and any look at your hidden
+#     checks (spawn --hidden, spawn --spot) or agent-grid's saved reviews
 #   - desktop notification when an agent finishes or needs you (NOTIFY=0 turns it off)
 #   - Stop, step 1: .agent-grid/verify.sh; failures go back to Claude (VERIFY_MAX times)
 #   - Stop, step 2: the manager. Code changes need a workflow
 #     (.agent-grid/workflows/<name>/run.sh + WORKFLOW.md). In a contained copy of the
-#     folder, it runs every workflow, then your checks (.agent-grid/checks.toml, via
-#     levy-check) and a backtest: last year's inputs through the new code must reproduce
-#     last year's certified roll. Anything that fails goes straight back. Then a second
+#     folder, it runs every workflow, then your checks (.agent-grid/checks.toml): check
+#     commands and golden tests (agent-check), and in a levy folder the roll rules and a
+#     backtest against last year's certified roll (levy-check). Anything that fails goes
+#     straight back. Your hidden checks run next; a failure comes to you. Then a second
 #     Claude tries to refute or break the work. The analyst waits for the verdict, and
 #     problems go straight back to it.
 #   - Stop, step 3: auto-push in `spawn --gh` sessions, only after checks and the manager pass
@@ -30,11 +32,13 @@ CONF="${XDG_CONFIG_HOME:-$HOME/.config}/agent-grid/config"
 [ -f "$CONF" ] && . "$CONF"
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/agent-grid"
 LOG="$STATE/agent-hook.log"
-SPOT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/agent-grid/spot"   # your hand-calculated parcels
+SPOT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/agent-grid/spot"     # a levy folder's hand-calculated parcels
+HIDDEN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/agent-grid/hidden" # your hidden check scripts, per folder
 EXT="${CODE_EXT:-py|md|toml|ts|tsx|js|jsx|sh|sql|r|R|go|rs}"
 CODE_ONLY=$(printf '%s' "$EXT" | tr '|' '\n' | grep -vx md | paste -sd'|' -)   # md alone needs no workflow
 SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
 LEVY_CHECK="$(dirname "$SELF")/levy-check"
+AGENT_CHECK="$(dirname "$SELF")/agent-check"
 TILDE='~'
 mkdir -p "$STATE/reviews"; chmod 700 "$STATE" 2>/dev/null
 
@@ -163,7 +167,24 @@ run_verify() {   # returns 0 = ok/none, 1 = blocked (already printed), 2 = gave 
 user_files() {   # $1 = folder (default DIR); relative paths, sorted
   ( cd "${1:-$DIR}" 2>/dev/null || exit 0
     for f in .agent-grid/checks.toml .agent-grid/review.md; do [ -f "$f" ] && echo "$f"; done
-    find .agent-grid/backtest -type f 2>/dev/null ) | sort
+    find .agent-grid/backtest .agent-grid/golden -type f 2>/dev/null
+    protect_list "$PWD" | grep -v '^\.agent-grid/' | while IFS= read -r p; do
+      [ -e "$p" ] && find "$p" -type f -not -path '*/__pycache__/*' 2>/dev/null
+    done ) | sort -u
+}
+# Paths in checks.toml's protect list (plus the always-protected ones), cached per folder
+protect_list() {   # $1 = folder (default DIR)
+  local d="${1:-$DIR}" c k cache
+  c="$d/.agent-grid/checks.toml"
+  if [ ! -f "$c" ] || ! grep -q '^[[:space:]]*protect[[:space:]]*=' "$c"; then
+    printf '%s\n' .agent-grid/checks.toml .agent-grid/review.md .agent-grid/backtest/ .agent-grid/golden/; return
+  fi
+  k=$(printf '%s' "$d" | md5sum | cut -c1-12); cache="$STATE/protect-$k"
+  if [ ! -s "$cache" ] || [ "$c" -nt "$cache" ]; then
+    ( cd "$d" && "$AGENT_CHECK" protect ) > "$cache.tmp" 2>/dev/null && mv "$cache.tmp" "$cache" || rm -f "$cache.tmp"
+  fi
+  if [ -s "$cache" ]; then cat "$cache"
+  else printf '%s\n' .agent-grid/checks.toml .agent-grid/review.md .agent-grid/backtest/ .agent-grid/golden/; fi
 }
 user_hash() {
   local l; l=$(user_files "${1:-$DIR}")
@@ -227,30 +248,32 @@ needs_test() {   # anything new since the last passing test?
 }
 
 # ---- Workflow checks (cheap, before anything runs) ---------------
-WORKFLOW_HELP='Write one workflow for each process the code runs (for example one per levy run):
+WORKFLOW_HELP='Write one workflow for each process the code runs (a build, a test run, a report, a data run):
 
 .agent-grid/workflows/<name>/run.sh
   The exact commands that produce the outputs. It runs from the folder root, in a
   copy of this folder, so use paths relative to the folder root. Exit non-zero if
   any step fails. Name the folder with letters, digits, dot, dash, or underscore.
-  If .agent-grid/checks.toml exists, the workflow must write the roll it names
-  ([roll] file), at that path and with those column names.
+  If .agent-grid/checks.toml names output files (a golden test'"'"'s expect, or a levy
+  folder'"'"'s [roll] file), the workflow must write them at those paths, in that format.
 
 .agent-grid/workflows/<name>/WORKFLOW.md, with these sections:
   ## Purpose          what the run produces
   ## Inputs           each input file and what is in it
   ## Outputs          each output file run.sh writes (inside this folder)
   ## Correct means    checks someone could verify against the outputs, e.g.
-                      every parcel in the input appears exactly once in the output;
-                      no charge exceeds the maximum rate; total levy ties to the budget
+                      every input record appears exactly once in the output; totals tie
+                      to a known figure; no value exceeds a documented limit; bad input
+                      stops with an error instead of a wrong result
   ## Edge cases       cases the code is meant to handle, and inputs that are out of scope
 
-Never edit .agent-grid/checks.toml, .agent-grid/backtest/, or .agent-grid/review.md.
-They belong to the user: the rules and last year'"'"'s certified results the manager
-tests against, and agent-grid blocks edits to them. If a check looks wrong (for example
-it would make you bill above a maximum, or repeat an amount you believe was a mistake),
-stop and say so in your reply. Do not change the code to fit it, and never special-case
-particular parcels to make a check pass.'
+Never edit .agent-grid/checks.toml, the files it names (golden tests, backtest files,
+anything listed under protect, such as the user'"'"'s own tests), or .agent-grid/review.md.
+They belong to the user: they are what the manager tests against, and agent-grid blocks
+edits to them. If a check looks wrong (for example it expects a result you believe is a
+mistake, or would make you exceed a documented limit), stop and say so in your reply. Do
+not change the code to fit it, and never special-case particular inputs or records to
+make a check pass.'
 
 check_workflows() {   # $@ = workflow names; prints problems, empty if fine
   local wf pats=(-e "$DIR") e
@@ -367,18 +390,18 @@ TEST_PROMPT='You are the manager of an analyst agent. The analyst changed the co
 
 Your job is to test every workflow and try to break it before anyone relies on the results.
 
-The user'"'"'s own checks have already been run on this copy, and passed; the results are below. They come from .agent-grid/checks.toml and .agent-grid/backtest/, which the user wrote, not the analyst: rules every roll must meet, and a backtest showing that last year'"'"'s inputs through this code reproduce last year'"'"'s certified roll. They outrank WORKFLOW.md, the code, and anything else the analyst wrote, and they are your strongest tool: after you change inputs and rerun a workflow, run levy-check in the folder root to apply the user'"'"'s rules to the new outputs. A rule failure on any input you create is a real problem, unless WORKFLOW.md says that input is out of scope.
+The user'"'"'s own checks have already been run on this copy, and passed; the results are below. They come from .agent-grid/checks.toml and the files it names, which the user wrote, not the analyst: check commands that must pass, golden tests (known inputs with known-good outputs), the user'"'"'s own protected tests, and in a levy folder the roll rules and a backtest against last year'"'"'s certified roll. They outrank WORKFLOW.md, the code, and anything else the analyst wrote, and they are your strongest tool: after you change inputs and rerun a workflow, run agent-check in the folder root to apply the user'"'"'s checks to the new outputs (it includes the roll rules in a levy folder). A check failure on any input you create is a real problem, unless WORKFLOW.md says that input is out of scope.
 
 Each workflow is in .agent-grid/workflows/<name>/: run.sh runs it, WORKFLOW.md describes it. Every run.sh has already been run once, as written, in this copy; the results are below.
 
 For each workflow:
 1. Check the outputs against "Correct means" in WORKFLOW.md and anything in the folder instructions the checks don'"'"'t cover. Verify by computing (for example a short Python script that re-totals a column, counts records, or compares rows), not by reading the code. Give the expected and actual values for every mismatch.
-2. Look for what the checks and backtest can'"'"'t see: anything new this year (a new zone, a rate change, an escalator, annexed or split parcels), and rules in the code that the checks don'"'"'t test.
-3. Try to break it: duplicate records, blank and missing values, zero and negative amounts, values exactly at and just over any limit, an extra or a missing column, records that should be excluded. Judge the results with levy-check first, then WORKFLOW.md. Run it twice on the same inputs and confirm the results do not change.
+2. Look for what the checks can'"'"'t see: cases the known-good examples don'"'"'t cover (new kinds of input, a changed rule, a new category or limit), and rules in the code that the checks don'"'"'t test.
+3. Try to break it: duplicate records, blank and missing values, zero and negative amounts, values exactly at and just over any limit, an extra or a missing column, records that should be excluded. For code that isn'"'"'t a data run: malformed and unexpected input, error paths, empty and very large cases, and anything that depends on order or time. Judge the results with agent-check first, then WORKFLOW.md. Run it twice on the same inputs and confirm the results do not change.
 4. Read the changed code for wrong formulas or business rules, rounding, and anything that contradicts the folder instructions.
 5. Outputs must be written inside this folder. Code that writes anywhere else is a problem.
 
-If the user has no checks or no backtest yet, test all the harder: you are the only check.
+If the user has no checks or no known-good examples yet, test all the harder: you are the only check.
 
 Stopping with a clear error on bad input is fine. A wrong result without an error, on any input, is a problem. Input that WORKFLOW.md says is out of scope is not. Do not comment on style, and do not report anything you are not sure of.
 
@@ -454,7 +477,7 @@ run_test() {
   # Your files: say so if they changed since the last test
   last=$(cat "$STATE/user-$KEY.sha" 2>/dev/null)
   if [ -n "$last" ] && [ "$last" != none ] && [ "$last" != "$(cat "$RUN/.user")" ]; then
-    RESULT_NOTE="Your checks, backtest files, or review.md changed since the last test. Make sure that was you."
+    RESULT_NOTE="Your checks or protected files (your tests, golden or backtest files, review.md) changed since the last test. Make sure that was you."
     notify "$name: your checks changed" "$RESULT_NOTE"
   fi
   cp "$RUN/.user" "$STATE/user-$KEY.sha"
@@ -487,74 +510,153 @@ run_test() {
   fi
   parts+=("ran ${#wfs[@]} workflow(s) in a copy")
 
-  # 2. Your checks on this year's run, then the backtest on last year's
-  local checks="" bt_out="" crc=0 brc=0 bt="$RUN/backtest" bwf dest src
-  if [ -f "$SNAP/.agent-grid/checks.toml" ]; then
-    checks=$(cd "$work" && AGENT_GRID_NESTED=1 contain timeout "$(cap 600)" "$LEVY_CHECK" rules 2>&1); crc=$?
-    if [ $crc -ne 0 ] && [ $crc -ne 1 ]; then
-      RESULT=ERROR; RESULT_NOTE="Your checks.toml can't be used: $(printf '%s' "$checks" | tail -n 3 | tr '\n' ' ')"
-      printf '# Checks for %s\n\n%s\n' "$DIR" "$checks" > "$RESULT_FILE"; return
-    fi
-    bwf=$(cd "$SNAP" && "$LEVY_CHECK" backtest-inputs 2>&1); brc=$?
-    if [ $brc -ne 0 ]; then
-      RESULT=ERROR; RESULT_NOTE="Your backtest can't be run: $(printf '%s' "$bwf" | tail -n 3 | tr '\n' ' ')"
-      printf '# Backtest for %s\n\n%s\n' "$DIR" "$bwf" > "$RESULT_FILE"; return
-    fi
-    if [ -n "$bwf" ]; then
-      clone "$bt"; [ -n "$rollp" ] && rm -f "$bt/$rollp"
-      while IFS=$'\t' read -r dest src; do
-        [ -n "$dest" ] || continue
-        mkdir -p "$bt/$(dirname "$dest")" && cp "$SNAP/$src" "$bt/$dest"
-      done < <(printf '%s\n' "$bwf" | tail -n +2)
-      bt_out=$(cd "$bt" && AGENT_GRID_NESTED=1 AGENT_GRID_AUTOPUSH=0 contain timeout "$(cap "${WORKFLOW_TIMEOUT:-900}")" \
-               bash ".agent-grid/workflows/$(printf '%s\n' "$bwf" | head -n 1)/run.sh" 2>&1); brc=$?
-      if [ $brc -ne 0 ]; then
-        bt_out=$(printf "The backtest's workflow failed on last year's inputs (exit %s):\n%s" "$brc" "$(printf '%s\n' "$bt_out" | tail -n 30)")
-        brc=1
-      else
-        bt_out=$(cd "$bt" && AGENT_GRID_NESTED=1 contain timeout "$(cap 600)" "$LEVY_CHECK" backtest-compare 2>&1); brc=$?
-        [ $brc -gt 1 ] && { RESULT=ERROR; RESULT_NOTE="Your backtest can't be compared: $(printf '%s' "$bt_out" | tail -n 3 | tr '\n' ' ')"; return; }
+  # 2. Your checks. A levy folder's roll rules and backtest (levy-check), then any check
+  #    commands and golden tests (agent-check): all from .agent-grid/checks.toml, which the
+  #    analyst can't change. Failures go straight back to the analyst.
+  local cfg="$SNAP/.agent-grid/checks.toml" plan="" fails="" n i nm cmd crc_ brc_ gdir out_ report="" checks="" bt_out=""
+  if [ -f "$cfg" ]; then
+    plan=$(cd "$SNAP" && "$AGENT_CHECK" plan 2>&1) || {
+      RESULT=ERROR; RESULT_NOTE="Your checks.toml can't be used: $(printf '%s' "$plan" | tail -n 2 | tr '\n' ' ')"
+      printf '# Checks for %s\n\n%s\n' "$DIR" "$plan" > "$RESULT_FILE"; return; }
+
+    # 2a. Levy folders: the roll rules on this year's run, then the backtest on last year's
+    if [ "$(printf '%s' "$plan" | jq -r .levy)" = true ]; then
+      local crc=0 brc=0 bt="$RUN/backtest" bwf dest src
+      checks=$(cd "$work" && AGENT_GRID_NESTED=1 contain timeout "$(cap 600)" "$LEVY_CHECK" rules 2>&1); crc=$?
+      if [ $crc -ne 0 ] && [ $crc -ne 1 ]; then
+        RESULT=ERROR; RESULT_NOTE="Your checks.toml can't be used: $(printf '%s' "$checks" | tail -n 3 | tr '\n' ' ')"
+        printf '# Checks for %s\n\n%s\n' "$DIR" "$checks" > "$RESULT_FILE"; return
       fi
-      rm -rf "$bt"
-    else
-      RESULT_NOTE="${RESULT_NOTE:+$RESULT_NOTE }checks.toml has no backtest yet: add last year's certified roll and inputs to catch changes that alter old results."
+      bwf=$(cd "$SNAP" && "$LEVY_CHECK" backtest-inputs 2>&1); brc=$?
+      if [ $brc -ne 0 ]; then
+        RESULT=ERROR; RESULT_NOTE="Your backtest can't be run: $(printf '%s' "$bwf" | tail -n 3 | tr '\n' ' ')"
+        printf '# Backtest for %s\n\n%s\n' "$DIR" "$bwf" > "$RESULT_FILE"; return
+      fi
+      if [ -n "$bwf" ]; then
+        clone "$bt"; [ -n "$rollp" ] && rm -f "$bt/$rollp"
+        while IFS=$'\t' read -r dest src; do
+          [ -n "$dest" ] || continue
+          mkdir -p "$bt/$(dirname "$dest")" && cp "$SNAP/$src" "$bt/$dest"
+        done < <(printf '%s\n' "$bwf" | tail -n +2)
+        bt_out=$(cd "$bt" && AGENT_GRID_NESTED=1 AGENT_GRID_AUTOPUSH=0 contain timeout "$(cap "${WORKFLOW_TIMEOUT:-900}")" \
+                 bash ".agent-grid/workflows/$(printf '%s\n' "$bwf" | head -n 1)/run.sh" 2>&1); brc=$?
+        if [ $brc -ne 0 ]; then
+          bt_out=$(printf "The backtest's workflow failed on last year's inputs (exit %s):\n%s" "$brc" "$(printf '%s\n' "$bt_out" | tail -n 30)")
+          brc=1
+        else
+          bt_out=$(cd "$bt" && AGENT_GRID_NESTED=1 contain timeout "$(cap 600)" "$LEVY_CHECK" backtest-compare 2>&1); brc=$?
+          [ $brc -gt 1 ] && { RESULT=ERROR; RESULT_NOTE="Your backtest can't be compared: $(printf '%s' "$bt_out" | tail -n 3 | tr '\n' ' ')"; return; }
+        fi
+        rm -rf "$bt"
+      else
+        RESULT_NOTE="${RESULT_NOTE:+$RESULT_NOTE }checks.toml has no backtest yet: add last year's certified roll and inputs to catch changes that alter old results."
+      fi
+      live "-- your roll checks:"; live "$checks"
+      [ -n "$bt_out" ] && { live "-- backtest:"; live "$bt_out"; }
+      record "your roll checks" "$([ $crc -eq 0 ] && echo PASS || echo FAIL)"
+      [ -n "$bwf" ] && record "backtest" "$([ $brc -eq 0 ] && echo PASS || echo FAIL)"
+      [ $crc -ne 0 ] && fails=$(printf "%s\n\nThis year's roll:\n%s" "$fails" "$checks")
+      [ $brc -ne 0 ] && fails=$(printf "%s\n\nBacktest (last year's inputs through your code, compared with last year's certified roll):\n%s" "$fails" "$bt_out")
+      report=$(printf '%s\n%s\n%s' "$report" "$checks" "${bt_out:+$bt_out}")
+      if [ $crc -eq 0 ]; then parts+=("your roll checks passed"); fi
+      if [ -z "$bwf" ]; then parts+=("no backtest yet"); elif [ $brc -eq 0 ]; then parts+=("backtest passed"); fi
     fi
-    live "-- your checks:"; live "$checks"
-    [ -n "$bt_out" ] && { live "-- backtest:"; live "$bt_out"; }
-    record "your checks" "$([ $crc -eq 0 ] && echo PASS || echo FAIL)"
-    [ -n "$bwf" ] && record "backtest" "$([ $brc -eq 0 ] && echo PASS || echo FAIL)"
-    if [ $crc -ne 0 ] || [ $brc -ne 0 ]; then
-      RESULT=FAIL; live "== stopped: your checks or the backtest failed; back to the analyst =="
-      RESULT_MSG="Your work failed the user's own checks, which come from .agent-grid/checks.toml and .agent-grid/backtest/ (the user wrote these, not you; never edit them). Find and fix the cause in the code. If a check itself looks wrong, stop and explain why in your reply: don't change the code to fit it, and never special-case parcels to make it pass."
-      [ $crc -ne 0 ] && RESULT_MSG=$(printf "%s\n\nThis year's run:\n%s" "$RESULT_MSG" "$checks")
-      [ $brc -ne 0 ] && RESULT_MSG=$(printf "%s\n\nBacktest (last year's inputs through your code, compared with last year's certified roll):\n%s" "$RESULT_MSG" "$bt_out")
+
+    # 2b. Check commands, run on this run's outputs
+    n=$(printf '%s' "$plan" | jq '.checks | length')
+    for ((i = 0; i < n; i++)); do
+      nm=$(printf '%s' "$plan" | jq -r ".checks[$i].name"); cmd=$(printf '%s' "$plan" | jq -r ".checks[$i].run")
+      out_=$(cd "$work" && AGENT_GRID_NESTED=1 AGENT_GRID_AUTOPUSH=0 contain timeout "$(cap "$(printf '%s' "$plan" | jq -r ".checks[$i].timeout")")" \
+             bash -c "$cmd" 2>&1); crc_=$?
+      live "-- your check \"$nm\": exit $crc_"
+      report=$(printf '%s\n%s %s' "$report" "$([ $crc_ -eq 0 ] && echo pass || echo FAIL)" "check \"$nm\": $cmd")
+      record "check: $nm" "$([ $crc_ -eq 0 ] && echo PASS || echo FAIL)"
+      [ $crc_ -ne 0 ] && fails=$(printf '%s\n\nYour check "%s" failed (exit %s): %s\n%s' "$fails" "$nm" "$crc_" "$cmd" "$(printf '%s\n' "$out_" | tail -n 30)")
+    done
+    [ "$n" -gt 0 ] && ! printf '%s' "$fails" | grep -q 'Your check "' && parts+=("your $n check command(s) passed")
+
+    # 2c. Golden tests: known inputs through the workflow, each in its own copy
+    n=$(printf '%s' "$plan" | jq '.golden | length')
+    local gpass=0 gwf ok o e
+    for ((i = 0; i < n; i++)); do
+      nm=$(printf '%s' "$plan" | jq -r ".golden[$i].name"); gwf=$(printf '%s' "$plan" | jq -r ".golden[$i].workflow")
+      if [ -z "$gwf" ]; then live "-- golden \"$nm\": waits for a workflow"; continue; fi
+      gdir="$RUN/golden-$i"; clone "$gdir"
+      while IFS=$'\t' read -r o e; do [ -n "$o" ] && rm -f "$gdir/$o"; done < <(printf '%s' "$plan" | jq -r ".golden[$i].expect[] | @tsv")
+      while IFS=$'\t' read -r o e; do
+        [ -n "$o" ] && mkdir -p "$gdir/$(dirname "$o")" && cp "$SNAP/$e" "$gdir/$o"
+      done < <(printf '%s' "$plan" | jq -r ".golden[$i].inputs[] | @tsv")
+      out_=$(cd "$gdir" && AGENT_GRID_NESTED=1 AGENT_GRID_AUTOPUSH=0 contain timeout "$(cap "${WORKFLOW_TIMEOUT:-900}")" \
+             bash ".agent-grid/workflows/$gwf/run.sh" 2>&1); brc_=$?
+      ok=1
+      if [ $brc_ -ne 0 ]; then
+        ok=0; out_=$(printf 'The workflow %s failed on these inputs (exit %s):\n%s' "$gwf" "$brc_" "$(printf '%s\n' "$out_" | tail -n 30)")
+      else
+        cmd=$(printf '%s' "$plan" | jq -r ".golden[$i].compare")
+        if [ -n "$cmd" ]; then
+          out_=$(cd "$gdir" && AGENT_GRID_NESTED=1 contain timeout "$(cap 600)" bash -c "$cmd" 2>&1) || ok=0
+        else
+          out_=""
+          while IFS=$'\t' read -r o e; do
+            [ -n "$o" ] || continue
+            out_="$out_$(cd "$gdir" && contain timeout "$(cap 300)" "$AGENT_CHECK" compare "$SNAP/$e" "$o" 2>&1)"$'\n' || ok=0
+          done < <(printf '%s' "$plan" | jq -r ".golden[$i].expect[] | @tsv")
+          printf '%s' "$out_" | grep -q '^DIFFERENT' && ok=0
+        fi
+      fi
+      rm -rf "$gdir"
+      live "-- golden \"$nm\": $([ $ok = 1 ] && echo match || echo different)"
+      report=$(printf '%s\n%s golden test "%s"' "$report" "$([ $ok = 1 ] && echo pass || echo FAIL)" "$nm")
+      record "golden: $nm" "$([ $ok = 1 ] && echo PASS || echo FAIL)"
+      if [ $ok = 1 ]; then gpass=$((gpass + 1))
+      else fails=$(printf '%s\n\nGolden test "%s" (known inputs with known-good outputs):\n%s' "$fails" "$nm" "$(printf '%s\n' "$out_" | tail -n 45)"); fi
+    done
+    [ "$n" -gt 0 ] && [ "$gpass" -eq "$n" ] && parts+=("$n golden test(s) matched")
+    if [ "$n" -eq 0 ] && [ "$(printf '%s' "$plan" | jq -r .levy)" != true ]; then
+      RESULT_NOTE="${RESULT_NOTE:+$RESULT_NOTE }checks.toml has no golden tests yet: known inputs with known-good outputs catch changes that alter old results."
+    fi
+
+    if [ -n "$fails" ]; then
+      RESULT=FAIL; live "== stopped: your checks failed; back to the analyst =="
+      RESULT_MSG=$(printf "Your work failed the user's own checks, from .agent-grid/checks.toml and the files it names (the user wrote these, not you; you can't change them). Find and fix the cause in the code. If a check itself looks wrong, stop and explain why in your reply: don't change the code to fit it, and never special-case particular inputs or records to make it pass.%s" "$fails")
       printf '# Checks for %s: FAIL\n\nCopy: %s\n\n%s\n\n## Runs\n%s\n' "$DIR" "$SROOT/$(base_slug)-last-failed" "$RESULT_MSG" "$runs" > "$RESULT_FILE"
       return
     fi
-    parts+=("your checks passed")
-    if [ -n "$bwf" ]; then parts+=("backtest passed"); else parts+=("no backtest yet"); fi
-
-    # Your hand-calculated parcels, kept outside the folder (spawn --spot). A mismatch comes
-    # to you, not the analyst: either the code or your figure is wrong, and the analyst
-    # never sees the figures, so it can't tune the code to them.
-    local spot="$SPOT_DIR/$KEY.toml" sp_out src
-    if [ -f "$spot" ]; then
-      sp_out=$(cd "$work" && AGENT_GRID_NESTED=1 AGENT_GRID_SPOT="$spot" contain timeout "$(cap 300)" "$LEVY_CHECK" spot 2>&1); src=$?
-      record "hand-calculated parcels" "$([ $src -eq 0 ] && echo PASS || echo FAIL)"
-      if [ $src -eq 1 ]; then
-        RESULT=SPOT; live "== stopped: your hand-calculated parcels don't match; handed to you =="
-        RESULT_NOTE="Your hand-calculated parcels don't match this roll. The analyst wasn't told. Decide whether the code or your figure is wrong."
-        printf '# Hand-calculated parcels for %s: MISMATCH\n\nCopy: %s\n\n%s\n' "$DIR" "$SROOT/$(base_slug)-last-failed" "$sp_out" > "$RESULT_FILE"
-        return
-      elif [ $src -ne 0 ]; then
-        RESULT=ERROR; RESULT_NOTE="Your hand-calculated parcels can't be checked: $(printf '%s' "$sp_out" | tail -n 2 | tr '\n' ' ')"
-        printf '# Hand-calculated parcels for %s\n\n%s\n' "$DIR" "$sp_out" > "$RESULT_FILE"; return
-      fi
-      parts+=("your hand-calculated parcels matched")
-    fi
   else
     parts+=("no checks.toml, so only the analyst's own criteria")
-    RESULT_NOTE="${RESULT_NOTE:+$RESULT_NOTE }No checks.toml, so this was checked against the analyst's own criteria only. Run levy-check init in the folder to start one."
+    RESULT_NOTE="${RESULT_NOTE:+$RESULT_NOTE }No checks.toml, so this was checked against the analyst's own criteria only. Run spawn --setup (or agent-check init) in the folder to start one."
+  fi
+
+  # 2d. Your hidden checks, kept outside the folder where analysts can't read them: a levy
+  #     folder's hand-calculated parcels (spawn --spot), and any scripts (spawn --hidden).
+  #     A failure comes to you, not the analyst: the code or your check is wrong, and the
+  #     analyst never sees them, so it can't tune the code to them.
+  local spot="$SPOT_DIR/$KEY.toml" hdir="$HIDDEN_DIR/$KEY" sp_out src hf hidden_fail=""
+  if [ -f "$spot" ] && [ "$(printf '%s' "$plan" | jq -r '.levy // false' 2>/dev/null)" = true ]; then
+    sp_out=$(cd "$work" && AGENT_GRID_NESTED=1 AGENT_GRID_SPOT="$spot" contain timeout "$(cap 300)" "$LEVY_CHECK" spot 2>&1); src=$?
+    record "hand-calculated parcels" "$([ $src -eq 0 ] && echo PASS || echo FAIL)"
+    if [ $src -eq 1 ]; then hidden_fail=$(printf '%s\n## Hand-calculated parcels\n%s\n' "$hidden_fail" "$sp_out")
+    elif [ $src -ne 0 ]; then
+      RESULT=ERROR; RESULT_NOTE="Your hand-calculated parcels can't be checked: $(printf '%s' "$sp_out" | tail -n 2 | tr '\n' ' ')"
+      printf '# Hand-calculated parcels for %s\n\n%s\n' "$DIR" "$sp_out" > "$RESULT_FILE"; return
+    else parts+=("your hand-calculated parcels matched"); fi
+  fi
+  if [ -d "$hdir" ]; then
+    local hn=0 hok=0
+    for hf in "$hdir"/*.sh; do
+      [ -f "$hf" ] || continue; hn=$((hn + 1))
+      out_=$(cd "$work" && AGENT_GRID_NESTED=1 AGENT_GRID_AUTOPUSH=0 contain timeout "$(cap 600)" bash "$hf" 2>&1); src=$?
+      record "hidden: $(basename "$hf" .sh)" "$([ $src -eq 0 ] && echo PASS || echo FAIL)"
+      if [ $src -eq 0 ]; then hok=$((hok + 1))
+      else hidden_fail=$(printf '%s\n## Hidden check %s (exit %s)\n%s\n' "$hidden_fail" "$(basename "$hf")" "$src" "$(printf '%s\n' "$out_" | tail -n 30)"); fi
+    done
+    [ "$hn" -gt 0 ] && [ "$hok" -eq "$hn" ] && parts+=("your $hn hidden check(s) passed")
+  fi
+  if [ -n "$hidden_fail" ]; then
+    RESULT=HIDDEN; live "== stopped: your hidden checks failed; handed to you =="
+    RESULT_NOTE="Your hidden checks failed on this work. The analyst wasn't told. Decide whether the code or your check is wrong."
+    printf '# Hidden checks for %s: FAIL\n\nCopy: %s\n%s\n' "$DIR" "$SROOT/$(base_slug)-last-failed" "$hidden_fail" > "$RESULT_FILE"
+    return
   fi
 
   # 3. The manager tries to refute or break the work
@@ -565,7 +667,7 @@ run_test() {
   live "-- manager (a fresh Claude) is testing$([ -n "$history" ] && echo ", with the record of earlier rounds"):"
   # stream-json lets spawn --watch follow along; the final answer is its "result" event
   printf '%s%s%s\n\n--- YOUR CHECKS ---\n%s\n\n--- BACKTEST ---\n%s\n\n--- RUNS ---\n%s\n\n--- CHANGES ---\n%s\n' \
-      "$TEST_PROMPT" "$(folder_rules)" "$history" "${checks:-(none: no .agent-grid/checks.toml)}" "${bt_out:-(none set up)}" "$runs" "$changes" \
+      "$TEST_PROMPT" "$(folder_rules)" "$history" "${report:-(none: no .agent-grid/checks.toml)}" "${bt_out:-(none set up)}" "$runs" "$changes" \
     | ( cd "$work" && AGENT_GRID_NESTED=1 AGENT_GRID_AUTOPUSH=0 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_PROJECT_DIR="$work" contain timeout "$(cap "${TEST_TIMEOUT:-2400}")" \
           "$cb" -p ${REVIEW_MODEL:+--model "$REVIEW_MODEL"} --output-format stream-json --verbose \
           --allowedTools "${TEST_TOOLS:-Read,Grep,Glob,Bash,Edit,Write}" 2>&1 ) \
@@ -609,7 +711,7 @@ run_test() {
 save_note() {   # notes are for you: into the saved review and the log
   [ -n "$RESULT_NOTE" ] || return 0
   [ -f "$RESULT_FILE" ] && printf '\nNote: %s\n' "$RESULT_NOTE" >> "$RESULT_FILE"
-  [ "$RESULT" != ERROR ] && [ "$RESULT" != SPOT ] && log "manager note: $RESULT_NOTE"
+  [ "$RESULT" != ERROR ] && [ "$RESULT" != HIDDEN ] && log "manager note: $RESULT_NOTE"
   return 0
 }
 mark_passed() {   # the next test starts from the moment this snapshot was taken
@@ -635,11 +737,11 @@ deliver_now() {   # returns 0 passed, 1 blocked, 2 handed to you
       mark_passed; cp -p "$RUN/.started" "$STATE/started-$KEY" 2>/dev/null; TESTED=1
       finish_run pass
       log "manager: passed: ${PASS_SUMMARY:-all tests}"; return 0 ;;
-    SPOT)
+    HIDDEN)
       finish_run keep
-      log "manager: your hand-calculated parcels don't match the roll, so it's handed to you (the analyst wasn't told). See ${RESULT_FILE/#$HOME/$TILDE}"
+      log "manager: your hidden checks failed, so it's handed to you (the analyst wasn't told). See ${RESULT_FILE/#$HOME/$TILDE}"
       set_status flagged
-      notify "$name: your parcels don't match" "The roll disagrees with your hand-calculated parcels. Nothing was pushed."; return 2 ;;
+      notify "$name: your hidden checks failed" "The work fails checks only you can see. Nothing was pushed."; return 2 ;;
     FAIL)
       finish_run keep
       next_round; case $? in
@@ -766,13 +868,13 @@ handle_stop() {
   else auto_push; fi
 }
 
-BRIEFING='agent-grid: you are an analyst agent with a manager. When you finish a turn that changed code, the manager runs every workflow in .agent-grid/workflows/ in a copy of this folder, runs the user'"'"'s checks and backtest (.agent-grid/checks.toml), and tries to refute or break your work. Problems come back to you. If there is no workflow for the code you change, your turn is sent back. The user'"'"'s checks are read-only to you: agent-grid blocks edits to them.'
+BRIEFING='agent-grid: you are an analyst agent with a manager. When you finish a turn that changed code, the manager runs every workflow in .agent-grid/workflows/ in a copy of this folder, runs the user'"'"'s checks (.agent-grid/checks.toml), and tries to refute or break your work. Problems come back to you. If there is no workflow for the code you change, your turn is sent back. The user'"'"'s checks are read-only to you: agent-grid blocks edits to them.'
 
 # ---- Before a tool runs: your files stay yours -------------------
 # In analyst sessions, edits to your checks, backtest, and review.md are blocked, and so
 # is any look at your hand-calculated parcels. Exit 2 blocks the tool call, and Claude
 # sees the message. A script that writes there anyway is still caught at the next test.
-PROTECTED='\.agent-grid/(checks\.toml|review\.md|backtest)'
+PROTECTED=""   # set in pre_tool, from protect_list
 deny() { printf 'agent-grid: %s\n' "$1" >&2; exit 2; }
 pre_tool() {
   local tool p rel cmd cwd ins
@@ -786,6 +888,10 @@ pre_tool() {
       deny "that's agent-grid's own data for the user (their hand-calculated parcels, the manager's saved reviews, and settings). Analysts don't read it: the manager compares the user's figures with your roll." ;;
   esac
   cwd=$(jget .cwd); cwd="${cwd:-$DIR}"
+  # One regex for every protected path: .agent-grid/checks.toml, golden/, backtest/,
+  # review.md, and whatever checks.toml lists under protect (your tests, specs)
+  # (a folder matches with or without its trailing slash, but not a longer name)
+  PROTECTED="($(protect_list | sed -e 's/[][\.*^$+?(){}|/]/\\&/g' -e 's/\\\/$/(\\\/|\\b)/' | paste -sd'|' -))"
   case "$tool" in
     Edit|Write|MultiEdit|NotebookEdit)
       p=$(printf '%s' "$input" | jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' 2>/dev/null)
@@ -794,14 +900,14 @@ pre_tool() {
       p=$(realpath -m "$p" 2>/dev/null || printf '%s' "$p")
       rel="${p#"$DIR"/}"
       [ "$rel" != "$p" ] || return 0
-      if printf '%s' "${rel,,}" | grep -qE "^${PROTECTED}"; then
-        deny "$rel belongs to the user (their checks, last year's certified results, or their folder rules), so analysts can't change it. If you believe it's wrong, stop and explain why in your reply. Don't change the code to fit it either."
+      if printf '%s' "$rel" | grep -qiE "^${PROTECTED}"; then
+        deny "$rel belongs to the user (their checks, their own tests, known-good results, or folder rules), so analysts can't change it. If you believe it's wrong, stop and explain why in your reply. Don't change the code to fit it either."
       fi ;;
     Bash)
       cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)
-      printf '%s' "$cmd" | grep -qE "$PROTECTED" || return 0
-      if printf '%s' "$cmd" | grep -qE ">>?[[:space:]]*[\"']?[^[:space:]|;&]*${PROTECTED}|(^|[;&|[:space:](])(tee|rm|mv|truncate|chmod|unlink)[[:space:]][^|;&]*${PROTECTED}|sed[[:space:]][^|;&]*-i[^|;&]*${PROTECTED}|${PROTECTED}[^|;&]*(write_text|write_bytes|\.save\(|to_csv\(|to_excel\()|open\([^)]*${PROTECTED}[^)]*,[^)]*[\"'][wax]"; then
-        deny "that command would change the user's checks, backtest, or review.md, which analysts can't change. Reading them is fine. If you believe one is wrong, stop and explain why in your reply."
+      printf '%s' "$cmd" | grep -qiE "$PROTECTED" || return 0
+      if printf '%s' "$cmd" | grep -qiE ">>?[[:space:]]*[\"']?[^[:space:]|;&]*${PROTECTED}|(^|[;&|[:space:](])(tee|rm|mv|truncate|chmod|unlink)[[:space:]][^|;&]*${PROTECTED}|sed[[:space:]][^|;&]*-i[^|;&]*${PROTECTED}|${PROTECTED}[^|;&]*(write_text|write_bytes|\.save\(|to_csv\(|to_excel\()|open\([^)]*${PROTECTED}[^)]*,[^)]*[\"'][wax]"; then
+        deny "that command would change files that belong to the user (their checks, their own tests, known-good results, or review.md), which analysts can't change. Reading and running them is fine. If you believe one is wrong, stop and explain why in your reply."
       fi ;;
   esac
   return 0

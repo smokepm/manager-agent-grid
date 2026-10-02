@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.15.0 (2026-10-02)
+
+A general tool: the answer key now works for any kind of code, and levy rolls are one domain pack.
+
+- `agent-check` and a general `checks.toml`:
+  - `protect`: your own tests, fixtures, and specs. Analysts can read and run them, never change them; the guard and change detection cover them.
+  - `[[check]]`: commands that must pass on each run's outputs, such as your test suite.
+  - `[[golden]]`: known inputs with known-good outputs. The workflow runs on them in its own copy, and each output must match exactly (text ignores line endings; .xlsx compares cell values), or pass a `compare` command.
+  - `agent-check` runs your check commands yourself, and the manager uses it after changing inputs.
+- Hidden checks: `spawn --hidden [DIR]` keeps scripts of your own outside the folder. They run on every test; a failure comes to you, not the analyst. `spawn --spot` is now the levy form of the same idea.
+- Setup is general: it works out what "correct" means from your tests, specs, and known-good outputs, and asks which tests you wrote yourself. Domain packs add steps for one kind of project: `domains/levy.md` ships with agent-grid, and your own go in `~/.config/agent-grid/domains/`.
+- The manager's instructions, the workflow help, and the analyst briefing no longer assume a levy roll.
+- Levy folders work as before: a `checks.toml` with `[roll]` gets the roll rules, max rates, totals, backtest, known differences, and hand-calculated parcels.
+
 ## 0.14.1 (2026-10-02)
 
 - Ready to publish: examples use made-up folders and figures, and the levy software isn't named. Set `LEVY_SOFTWARE` in your config to name yours, and setup is told to look for its certified rolls and exports.

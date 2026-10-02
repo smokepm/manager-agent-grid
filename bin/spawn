@@ -49,12 +49,14 @@
 #   --manager-feed       the manager pane's live view (agents, reviews, findings)
 #
 # The manager:
-#   --setup [DIR]        have Claude set up a folder's checks: it finds the roll, last
-#                        year's certified roll and inputs, writes checks.toml, and shows
-#                        you where every number came from. spawn offers this at launch
-#                        for any folder without checks.
-#   --spot [DIR]         your hand-calculated parcels for a folder: kept outside it, so
-#                        analysts never see them; the manager compares the roll with them
+#   --setup [DIR]        have Claude set up a folder's checks: it finds what "correct"
+#                        means from your tests, specs, and known-good outputs (in a levy
+#                        folder, the RMA and last year's certified roll), writes
+#                        checks.toml, and shows you where every check came from. spawn
+#                        offers this at launch for any folder without checks.
+#   --hidden [DIR]       your hidden checks for a folder: scripts kept outside it, so
+#                        analysts never see them; a failure comes to you, not the analyst
+#   --spot [DIR]         levy folders: your hand-calculated parcels, compared with the roll
 #   --test [DIR]         run the manager's test on a folder now, in the foreground
 #   --watch [DIR]        follow the manager's test of a folder live, and each one after
 #                        it (Ctrl+b W does this for the pane you're in)
@@ -211,9 +213,9 @@ doctor() {
     fi
   fi
   local py="$HOME/.venv/bin/python"; [ -x "$py" ] || py=python3
-  if "$py" -c 'import tomllib, openpyxl' 2>/dev/null; then ok "levy-check ($("$py" --version 2>&1), reads .csv and .xlsx)"
-  elif "$py" -c 'import tomllib' 2>/dev/null; then meh "levy-check can't read .xlsx rolls: $py -m pip install openpyxl"
-  else bad "levy-check needs Python 3.11+ ($("$py" --version 2>&1) found)"; fi
+  if "$py" -c 'import tomllib, openpyxl' 2>/dev/null; then ok "agent-check and levy-check ($("$py" --version 2>&1), read .csv and .xlsx)"
+  elif "$py" -c 'import tomllib' 2>/dev/null; then meh "agent-check and levy-check can't read .xlsx files: $py -m pip install openpyxl"
+  else bad "agent-check and levy-check need Python 3.11+ ($("$py" --version 2>&1) found)"; fi
   if command -v flock >/dev/null; then ok "flock (Excel tests take turns)"
   else bad "flock is missing (util-linux)"; fi
 
@@ -260,32 +262,48 @@ doctor() {
 # a summary the user confirms.
 setup_prompt() {   # $1 = new | existing
   cat << 'P'
-Set up the agent-grid manager's checks for this levy folder, in .agent-grid/checks.toml.
+Set up the agent-grid manager's checks for this folder, in .agent-grid/checks.toml.
 
-These checks are the user's independent answer key. Analyst agents write the levy code; the manager tests that code against these checks. So build them only from the data, last year's certified results, and the RMA or other district documents. Never derive a rule or a number from this folder's levy code: if the code is wrong, checks copied from it would be wrong in the same way. You may look at code and config only to learn file names and column layouts. For the same reason, never take a rule or a number from Claude memory notes, past session transcripts, or anything an earlier AI session wrote, and don't write memory notes yourself.
+These checks are the user's independent answer key. Analyst agents write the code; the manager tests that code against these checks. So build them only from sources that don't depend on this folder's code being right: specifications and requirement documents, tests the user wrote themselves, known-good outputs (from a past release, an earlier run someone checked, or another system), reference data, and documents that state the rules. Never derive a rule or an expected value from the code: if the code is wrong, checks copied from it would be wrong in the same way. You may look at code and config only to learn file names, commands, and layouts. For the same reason, never take a rule or a value from Claude memory notes, past session transcripts, or anything an earlier AI session wrote, and don't write memory notes yourself.
 
-Search only this folder and the folder it sits in. If you can't find a file there, ask the user where it is instead of searching the rest of the computer.
+Search only this folder and the folder it sits in. If you can't find something there, ask the user where it is instead of searching the rest of the computer.
 
-1. Find the roll this folder produces: the parcel-level levy output (.csv or .xlsx) and its columns for the APN and the levy amount, plus max tax, units, rate, and the rate class (zone, land use) if present. Look at existing outputs, any workflows in .agent-grid/workflows/, and config files. If no roll exists yet, choose output/levy_roll.csv with columns APN and Levy, and say so; the analyst's workflow will be required to write it there.
-2. Find last year's certified roll, the final roll that went to the county. Look in prior fiscal-year folders and your levy software's exports. Then find last year's version of every input the levy reads (county export, rates, budget, config).
-3. Run levy-check init if .agent-grid/checks.toml doesn't exist, then fill it in. Turn on a rule only if you can confirm it from the RMA or the data: max_tax only if there is a max tax column, max_tax_is_units_x_rate only if the RMA defines it that way, total only if you find this year's levy requirement in the budget, and parcels_file only if the county export lists every parcel that should be on the roll. Also fill in, where the documents support it:
-   - [max_rates]: each rate class's maximum rate per unit, from the RMA (base rate, base year, escalator, and rounding) or from a district document that states this year's max. levy-check then works out the max itself instead of trusting the roll's own columns. Note the document, page, and section next to each.
-   - unique_by, if a parcel can rightly appear more than once (for example one line per assessment or funding): the columns that together identify one line.
-   - [totals]: expected totals by district or zone, if the budget gives them.
-4. Copy last year's certified roll and last year's inputs into .agent-grid/backtest/, and fill in [backtest] and [backtest.inputs]. Leave backtest.workflow blank unless the folder has more than one workflow. Don't change or add to last year's input files. If last year's levy depended on a decision someone made by hand (a credit, a status typed into a working file), ask the user how next year's run will get that decision. If some parcels can't be reproduced for a real reason, list each one under [backtest.known_differences] with the reason. Never excuse a whole district or zone.
-5. Run levy-check on the most recent accepted roll in the folder. If a rule fails on a roll that was actually certified, do not quietly turn the rule off: either the rule doesn't fit this district or that roll had a real problem. Report it and ask. Never set up a check that requires repeating an amount over the RMA maximum: list those parcels as known differences and tell the user. Then run levy-check selftest.
-6. Only write inside .agent-grid/. Never edit code, inputs, or outputs elsewhere.
+1. Work out what this folder's code does and how it runs: the outputs it writes, and the commands that build, test, or run it. Look at the README, any workflows in .agent-grid/workflows/, and config files.
+2. Find what "correct" means, from independent sources: the user's own tests, a spec, known-good outputs, and documented rules. If it isn't clear which tests the user wrote themselves, ask: tests written by an AI agent can share the code's mistakes.
+3. Run agent-check init if .agent-grid/checks.toml doesn't exist, then fill it in:
+   - protect: the user's own tests, fixtures, and specs, so analysts can read and run them but never change them.
+   - [[check]]: commands that must pass, such as the user's test suite. Run each one first; add it only if it passes on the current code, or report why it fails.
+   - [[golden]]: known inputs with known-good outputs. Copy them into .agent-grid/golden/<name>/ and name the output each expected file is compared with. Use compare instead of an exact match only when exact is too strict (timestamps, ordering), and say why.
+4. Run agent-check. If a check fails on code that was known to be right, don't quietly drop it: either the check doesn't fit, or that code had a real problem. Report it and ask.
+5. Only write inside .agent-grid/. Never edit code, tests, inputs, or outputs elsewhere.
 
-How levy-check works, so you don't need to read its source: "levy-check init" writes a commented .agent-grid/checks.toml template (it explains every setting). "levy-check" checks the roll named in [roll] against the rules; it exits 0 if everything passes, 1 if a check fails, and 2 if checks.toml or a file it names can't be used, with the reason. "levy-check selftest" plants errors in copies of the rolls (nothing on disk changes) and reports which checks catch each one. Run it from the folder root. Run one command per Bash call, not several joined with ; or && or |, because single commands like levy-check, ls, and python3 are pre-approved and won't interrupt the user. Use the Read tool to look at text files and python3 with openpyxl for spreadsheets.
+How agent-check works, so you don't need to read its source: "agent-check init" writes a commented .agent-grid/checks.toml template (it explains every setting). "agent-check" runs every [[check]] command; it exits 0 if all pass, 1 if a check fails, and 2 if checks.toml or a file it names can't be used, with the reason. "agent-check compare EXPECTED ACTUAL" compares an output with its known-good version. Run them from the folder root. Run one command per Bash call, not several joined with ; or && or |, because single commands like agent-check, ls, and python3 are pre-approved and won't interrupt the user. Use the Read tool to look at text files and python3 with openpyxl for spreadsheets.
 
 Finish with a short summary for the user, in plain language:
-- each check you turned on, and the file (and sheet, row, cell, or page and section) its number or rule came from;
+- each check you set up, and where its rule or expected value came from (file, section, or the user);
+- which paths are protected;
 - what you couldn't find, and what you assumed;
-- any rule that failed on last year's certified roll, and each known difference with its reason;
-- the errors selftest reported as MISSED, in plain words: those are what these checks can't catch;
-- a suggestion to hand-calculate a few parcels, one per rate class, with spawn --spot. Those stay outside the folder, where analysts can't see them.
-Ask only what you can't settle yourself, such as two candidate certified rolls that disagree. When the user confirms, tell them to type /exit to continue.
+- any check that fails on code believed to be right;
+- what these checks can't catch: behavior no test or known-good example covers;
+- a suggestion to write a few hidden checks with spawn --hidden: cases the user works out themselves, kept outside the folder where analysts can't see them.
+Ask only what you can't settle yourself, such as two sources that disagree. When the user confirms, tell them to type /exit to continue.
 P
+  # Domain packs: extra setup steps for a kind of project (domains/*.md here, and your own in
+  # ~/.config/agent-grid/domains/). Each says when it applies; setup follows the one that fits.
+  local f first=1
+  for f in "$ROOT"/domains/*.md "$CONF_DIR"/domains/*.md; do
+    [ -f "$f" ] || continue
+    if [ $first = 1 ]; then
+      printf '
+%s
+' "Domain notes. If one of these fits this folder, follow it as part of this setup; if none fits, ignore them all and say which you used in your summary."
+      first=0
+    fi
+    printf '
+----- %s -----
+%s
+' "$(basename "$f" .md)" "$(cat "$f")"
+  done
   [ -n "${LEVY_SOFTWARE:-}" ] && printf '
 %s
 ' "The levy software here is ${LEVY_SOFTWARE}: certified rolls and levy exports come from it."
@@ -300,7 +318,7 @@ setup_checks() {   # $1 = folder
   command -v claude >/dev/null || die "Claude Code isn't installed."
   state=new; [ -f "$dir/.agent-grid/checks.toml" ] && state=existing
   printf '\033[1;35mSetting up the checks for %s\033[0m\n' "$(basename "$dir")"
-  echo "Claude will find the files, write .agent-grid/checks.toml, and summarize where every number came from."
+  echo "Claude will work out what correct means here, write .agent-grid/checks.toml, and summarize where every check came from."
   echo "Look over its summary, then type /exit to continue."
   echo
   # AGENT_GRID_SETUP: this session isn't an analyst, so the manager never reviews it; the
@@ -310,9 +328,39 @@ setup_checks() {   # $1 = folder
   local pane="${TMUX_PANE:-}" rc
   [ -n "$pane" ] && tmux set -p -t "$pane" @status setup 2>/dev/null && tmux set -p -t "$pane" @status_at "$(date +%H:%M)" 2>/dev/null
   ( cd "$dir" && AGENT_GRID_SETUP=1 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 claude "$(setup_prompt "$state")" --permission-mode acceptEdits \
-      --allowedTools "Read,Grep,Glob,Bash(levy-check:*),Bash(python3:*),Bash($py:*),Bash(ls:*),Bash(find:*),Bash(head:*),Bash(cat:*),Bash(wc:*),Bash(file:*),Bash(cp:*),Bash(mkdir:*)" ); rc=$?
+      --allowedTools "Read,Grep,Glob,Bash(agent-check:*),Bash(levy-check:*),Bash(python3:*),Bash($py:*),Bash(ls:*),Bash(find:*),Bash(head:*),Bash(cat:*),Bash(wc:*),Bash(file:*),Bash(cp:*),Bash(mkdir:*)" ); rc=$?
   [ -n "$pane" ] && tmux set -pu -t "$pane" @status 2>/dev/null
   return $rc
+}
+
+# ---- Your hidden checks --------------------------------------------
+# Scripts kept under ~/.config/agent-grid/hidden/<folder>/, outside the folder, so analysts
+# never see them and can't tune the code to them. The hook blocks analysts from reading them.
+hidden_edit() {   # $1 = folder
+  local dir key d f
+  dir=$(cd "${1:-.}" 2>/dev/null && pwd -P) || die "No such folder: $1"
+  key=$(printf '%s' "$dir" | md5sum | cut -c1-12)
+  d="$CONF_DIR/hidden/$key"; f="$d/check.sh"
+  mkdir -p "$d" && chmod 700 "$CONF_DIR/hidden" "$d"
+  [ -f "$d/FOLDER" ] || echo "$dir" > "$d/FOLDER"
+  if ! ls "$d"/*.sh >/dev/null 2>&1; then
+    cat > "$f" << EOF
+#!/usr/bin/env bash
+# A hidden check for $(short "$dir"). It runs from the root of a test copy of the folder,
+# after the workflows, every time the manager tests. Exit 0 if the work is right, non-zero
+# (with a message) if not. Analysts never see this file, and a failure comes to you, so
+# use cases you worked out yourself, without looking at the analyst's code.
+# Add more checks as more .sh files in this folder: $(short "$d")
+# (If you move or rename the folder, run spawn --hidden there again: these go by path.)
+#
+# Example: one known input, worked out by hand, through the program:
+#   result=\$(python3 main.py --input fixtures/case1.json)
+#   [ "\$result" = "42.50" ] || { echo "case1: expected 42.50, got \$result"; exit 1; }
+exit 0
+EOF
+  fi
+  echo "Hidden checks for $(basename "$dir"): $(short "$d")"
+  "${EDITOR:-nano}" "$f"
 }
 
 # ---- Your hand-calculated parcels ----------------------------------
@@ -580,6 +628,8 @@ for ((i = 0; i < ${#argv[@]}; i++)); do
                  setup_checks "$nxt"; exit $? ;;
     --spot)      nxt="${argv[$((i + 1))]:-.}"; [[ "$nxt" == -* ]] && nxt=.
                  spot_edit "$nxt"; exit $? ;;
+    --hidden)    nxt="${argv[$((i + 1))]:-.}"; [[ "$nxt" == -* ]] && nxt=.
+                 hidden_edit "$nxt"; exit $? ;;
     --watch)     nxt="${argv[$((i + 1))]:-}"; [[ "$nxt" == -* ]] && nxt=""
                  watch_review "$nxt"; exit $? ;;
     --version)   echo "spawn (agent-grid) $(version)"; exit 0 ;;
