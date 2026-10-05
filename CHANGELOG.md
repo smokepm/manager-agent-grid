@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.17.0 (2026-10-05)
+
+- **Pick up past conversations:** `spawn -R` (or `--sessions`) asks, for each folder you pick, which past Claude conversation to resume: newest first, titled with Claude's summary or your first message, with a preview of the last few messages, or a new one. Workspaces remember `-R`, and `PICK_SESSIONS=1` makes it the default.
+- **Claude Desktop sessions on WSL:** the Desktop app keeps its sessions under the Windows profile, named after Windows paths, so WSL never saw them. `spawn --import-desktop` copies them into WSL under the matching names, and it happens automatically before `-R` and `-r` (`AUTO_IMPORT_DESKTOP=0` turns that off). They're marked [desktop] in the list. `spawn --doctor` says when there are new ones.
+- The installer now installs `rsync`.
+
 ## 0.16.1 (2026-10-02)
 
 Safer tests, merged in from a parallel 0.16.0.

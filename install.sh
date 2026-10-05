@@ -99,6 +99,8 @@ WORKFLOW_COPY_MAX_MB=${WORKFLOW_COPY_MAX_MB:-2000}
 WORKFLOW_KEEP_FAILED=${WORKFLOW_KEEP_FAILED:-1}
 WORKFLOW_KEEP_DAYS=${WORKFLOW_KEEP_DAYS:-3}
 REVIEW_KEEP_DAYS=${REVIEW_KEEP_DAYS:-30}
+PICK_SESSIONS=${PICK_SESSIONS:-0}
+AUTO_IMPORT_DESKTOP=${AUTO_IMPORT_DESKTOP:-1}
 EOF
 if [ $IS_WSL -eq 1 ]; then
   cat >> "$CONF" << EOF
@@ -111,11 +113,11 @@ echo "Saved to $CONF"
 # ------------------------------------------------------------------
 step "Installing packages"
 if [ "$PM" = dnf ]; then
-  sudo dnf install -y zsh util-linux-user git tmux python3-pip fzf jq gh nano curl bubblewrap gawk
+  sudo dnf install -y zsh util-linux-user git rsync tmux python3-pip fzf jq gh nano curl bubblewrap gawk
   if [ $IS_WSL -eq 0 ]; then sudo dnf install -y wl-clipboard xclip fontconfig libnotify; fi
 else
   sudo apt-get update -qq
-  sudo apt-get install -y zsh git tmux python3-venv python3-pip fzf jq nano curl bubblewrap
+  sudo apt-get install -y zsh git rsync tmux python3-venv python3-pip fzf jq nano curl bubblewrap
   if [ $IS_WSL -eq 0 ]; then sudo apt-get install -y wl-clipboard xclip fontconfig libnotify-bin; fi
   sudo apt-get install -y gh || warn "Couldn't install gh from apt. See https://cli.github.com"
 fi

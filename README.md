@@ -81,6 +81,8 @@ The first `spawn --gh` walks you through `gh auth login` if you haven't done it.
 | `spawn --no-manager` | Launch without the manager (no reviews, no manager pane) |
 | `spawn --worktrees 3` | Three agents on the current repo, each on its own branch |
 | `spawn -r` | Resume each folder's last conversation (fresh Claude if none) |
+| `spawn -R` | Pick which past conversation to resume in each folder, with a preview |
+| `spawn --import-desktop` | WSL: bring Claude Desktop app sessions into WSL |
 | `spawn -c "npm run dev"` | Run any command instead of Claude |
 | `spawn -c ""` | Plain shells |
 | `spawn -t` | One tab per folder instead of a tiled grid |
@@ -114,6 +116,18 @@ spawn --forget work                         # delete one
 ```
 
 A workspace saved without folders opens the picker under its base folder, which makes a handy shortcut for a directory you work in often.
+
+### Past conversations: `spawn -R`
+
+```
+spawn -R                                    # pick folders, then a conversation for each
+spawn -R api web                            # same, for these folders
+spawn -w work -R                            # with a workspace (saving with -R remembers it)
+```
+
+After you pick folders, `-R` shows each folder's past Claude conversations, newest first: when it was last used and its title (Claude's summary, or your first message), with a preview of the last few messages. Pick one to resume it in that folder's pane, or **[ New conversation ]** (or `Esc`) to start fresh. Folders with no past conversations skip the question. `-r` is the quick version: it resumes each folder's most recent conversation without asking. Set `PICK_SESSIONS=1` to always be asked.
+
+**Claude Desktop sessions on WSL.** The Desktop app keeps its Code sessions in your Windows profile, named after the Windows path (`C--Users-...`), so Claude Code in WSL never sees them. agent-grid brings them over, renamed to match the WSL path, before `-R` and `-r` look (marked **[desktop]** in the list), and `spawn --import-desktop` does it on demand. It copies, so the Desktop app keeps its own; a conversation continued in both places keeps the newer copy. `spawn --doctor` tells you when there are Desktop sessions WSL hasn't seen. Conversations from the Desktop app's Chat tab live in your claude.ai account, not on disk, so they can't be resumed here.
 
 ### GitHub mode: `spawn --gh`
 
@@ -403,6 +417,8 @@ Settings live in `~/.config/agent-grid/config`; workspaces in `~/.config/agent-g
 | `WORKFLOW_KEEP_FAILED` | `1` (default) keeps the latest failed copy for you to inspect |
 | `WORKFLOW_KEEP_DAYS` | Days a failed copy is kept (default 3) |
 | `REVIEW_KEEP_DAYS` | Days saved reviews are kept (default 30) |
+| `PICK_SESSIONS` | `1` asks which past conversation to resume in each folder on every launch (like `-R`); `0` (default) only with `-R` |
+| `AUTO_IMPORT_DESKTOP` | WSL: `1` (default) brings Claude Desktop sessions over before `-R` and `-r`; `0` only with `spawn --import-desktop` |
 | `ANALYST_AUTO_MEMORY` | `1` (default) leaves Claude's auto memory on for analysts; `0` turns it off. Setup sessions and the manager always run without it |
 | `WIN_PY` | WSL only: Windows `python.exe` used by `winpy` |
 
@@ -447,6 +463,7 @@ Start with `spawn --doctor`. It names the problem and the fix for most of these.
 | `winpy` workflows fail only under the manager | Run `spawn --doctor`. If Windows programs don't start inside containment, `CONTAIN=0` with `ALLOW_UNCONTAINED=1` tests them uncontained, with a read-only manager |
 | "push failed" in the doctor log | Run `git push` in that folder to see the full error |
 | `$'\r': command not found` (WSL) | The scripts got Windows line endings: `sed -i 's/\r$//' ~/agent-grid/install.sh ~/agent-grid/bin/*` |
+| `-R` or `claude --resume` doesn't list Desktop app sessions (WSL) | Run `spawn --import-desktop` (it needs `rsync`). Only Code sessions on this PC come over; Chat-tab conversations live in your claude.ai account |
 | tmux sessions gone | WSL or the machine restarted. Conversations are saved: `spawn -r` (or `spawn -w NAME -r`) resumes them |
 
 ## License

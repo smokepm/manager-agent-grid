@@ -32,6 +32,9 @@
 #   -b DIR           base directory to pick from (default: current directory)
 #   -c CMD           command for each pane (default: claude). Empty = plain shell.
 #   -r               resume: claude --continue, or a fresh claude if no history
+#   -R, --sessions   pick which past conversation to resume in each folder: newest
+#                    first, with a preview, or start a new one (on WSL, Desktop app
+#                    sessions are included). PICK_SESSIONS=1 makes this the default.
 #   -t               tabs: one tmux window per folder
 #   -d N             folder depth shown in the picker (default: 2)
 #   -s NAME          tmux session to add to (default: TMUX_SESSION in config, else grid)
@@ -68,6 +71,8 @@
 #   --forget NAME    delete a workspace
 #
 # Other:
+#   --import-desktop WSL: bring Claude Desktop app sessions into WSL, so --resume,
+#                    -r, and -R find them (also done automatically before -R and -r)
 #   --doctor         check the setup and recent auto-push activity
 #   --version        show the version
 #   -h, --help       show this help
@@ -89,6 +94,7 @@ TILDE='~'
 ORIG_PWD="$PWD"; BASE="$PWD"; CMD="claude"; DEPTH=2; SESSION="${TMUX_SESSION:-grid}"
 TABS=0; CLOSE=0; LABEL="spawn"; GH=0; SUFFIX=""; WT=0; SAVE=""; WS=""
 PROMPT=""; PROMPT_FILE=""; SEND=0; SEND_TEXT=""; SEND_ALL=0; REVIEW="${REVIEW_DEFAULT:-1}"
+PICK="${PICK_SESSIONS:-0}"
 WS_FOLDERS=(); FOLDERS=()
 
 die()   { echo "$*" >&2; exit 1; }
@@ -110,7 +116,7 @@ load_ws() {
   . "$f"
   BASE="$WS_BASE"; GH="${WS_GH:-0}"; TABS="${WS_TABS:-0}"; CLOSE="${WS_CLOSE:-0}"
   CMD="${WS_CMD-claude}"; SUFFIX="${WS_SUFFIX:-}"; WT="${WS_WORKTREES:-0}"; LABEL="$1"
-  REVIEW="${WS_REVIEW:-$REVIEW}"
+  REVIEW="${WS_REVIEW:-$REVIEW}"; PICK="${WS_SESSIONS:-$PICK}"
 }
 
 save_ws() {
@@ -119,7 +125,7 @@ save_ws() {
     echo "# agent-grid workspace. Open with: spawn -w $1"
     printf 'WS_BASE=%q\n' "$BASE"
     printf 'WS_GH=%q\nWS_TABS=%q\nWS_CLOSE=%q\nWS_WORKTREES=%q\nWS_REVIEW=%q\n' "$GH" "$TABS" "$CLOSE" "$WT" "$REVIEW"
-    printf 'WS_CMD=%q\nWS_SUFFIX=%q\n' "$CMD" "$SUFFIX"
+    printf 'WS_CMD=%q\nWS_SUFFIX=%q\nWS_SESSIONS=%q\n' "$CMD" "$SUFFIX" "$PICK"
     printf 'WS_FOLDERS=('
     [ ${#FOLDERS[@]} -gt 0 ] && printf ' %q' "${FOLDERS[@]}"
     printf ' )\n'
@@ -143,9 +149,97 @@ list_ws() {
       [ "${WS_GH:-0}" = 1 ] && flags="$flags --gh"
       [ "${WS_REVIEW:-1}" = 0 ] && flags="$flags --no-manager"
       [ "${WS_TABS:-0}" = 1 ] && flags="$flags -t"
+      [ "${WS_SESSIONS:-0}" = 1 ] && flags="$flags -R"
       printf '  %-16s %s  (%s)%s\n' "$(basename "$f" .ws)" "$(short "$WS_BASE")" "$desc" "$flags"
     )
   done
+}
+
+# ---- Past conversations --------------------------------------------
+# Claude Code keeps each folder's conversations in ~/.claude/projects/<folder path, with
+# every character that isn't a letter or digit turned into "-">/<id>.jsonl. On WSL, the
+# Desktop app keeps its own under the Windows profile, named after the Windows path
+# (C--Users-...), so WSL never sees them unless they're brought over.
+proj_dir() { printf '%s/.claude/projects/%s' "$HOME" "$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"; }
+
+win_projects() {   # the Desktop app's projects folder, on WSL
+  [ -n "${WSL_DISTRO_NAME:-}" ] || return 1
+  local wh="${WIN_HOME:-}"
+  if [ ! -d "$wh" ] && [ -x /mnt/c/Windows/System32/cmd.exe ]; then
+    wh=$(cd /mnt/c && /mnt/c/Windows/System32/cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')
+    [ -n "$wh" ] && wh=$(wslpath "$wh")
+  fi
+  [ -d "$wh/.claude/projects" ] || return 1
+  printf '%s/.claude/projects' "$wh"
+}
+
+import_desktop() {   # $1 = quiet | dry ; prints how many sessions were new or updated
+  local win d n dest out count=0 opts=(-a --update --out-format=%n)
+  win=$(win_projects) || { [ "$1" = quiet ] || echo "No Claude Desktop sessions to import (this only applies on WSL)."; return 0; }
+  command -v rsync >/dev/null || { [ "$1" = quiet ] || warn "rsync is missing: sudo dnf install rsync (or sudo apt install rsync)"; return 1; }
+  [ "$1" = dry ] && opts+=(--dry-run)
+  for d in "$win"/*/; do
+    n=$(basename "$d")
+    [[ "$n" =~ ^([A-Za-z])--(.*)$ ]] || continue
+    dest="$HOME/.claude/projects/-mnt-${BASH_REMATCH[1],,}-${BASH_REMATCH[2]}"
+    [ "$1" = dry ] || mkdir -p "$dest"
+    out=$(rsync "${opts[@]}" "$d" "$dest/" 2>/dev/null | grep -c '\.jsonl$')
+    count=$((count + out))
+  done
+  case "$1" in
+    dry)   echo "$count" ;;
+    quiet) [ "$count" -gt 0 ] && echo "Brought over $count new or updated Claude Desktop session(s)." ;;
+    *)     echo "Brought over $count new or updated Claude Desktop session(s) from $(short "$win")."
+           echo "claude --resume, spawn -r, and spawn -R now find them in the matching folders." ;;
+  esac
+  return 0
+}
+
+# jq: one message's text, or "" for tool traffic and Claude Code's own notes
+JQ_TEXT='select((.type == "user" or .type == "assistant") and (.isMeta | not))
+  | [.type, ((.message.content // "") | if type == "string" then . else ([.[]? | select(.type == "text") | .text] | join(" ")) end)]
+  | select((.[1] | length) > 0 and ((.[1] | test("^(<command-|<local-command|<system-reminder|Caveat:|\\[Request interrupted)")) | not))'
+
+session_title() {   # $1 = transcript: Claude's summary, else your first message
+  local t
+  t=$(grep -m1 '"type":"summary"' "$1" 2>/dev/null | jq -r '.summary // empty' 2>/dev/null)
+  [ -n "$t" ] || t=$(head -n 400 "$1" | jq -r "$JQ_TEXT | select(.[0] == \"user\") | .[1]" 2>/dev/null | head -n 1)
+  printf '%s' "$t" | tr '\n\t' '  ' | cut -c1-90
+}
+
+session_rows() {   # $1 = folder: "transcript <tab> description", newest first
+  local f title when src
+  find "$(proj_dir "$1")" -maxdepth 1 -name '*.jsonl' ! -name 'agent-*' -printf '%T@\t%p\n' 2>/dev/null \
+    | sort -rn | head -n 60 | cut -f2- | while IFS= read -r f; do
+    title=$(session_title "$f"); [ -n "$title" ] || continue
+    when=$(date -r "$f" '+%b %d %H:%M')
+    src=""; grep -m1 -q '"cwd":"[A-Za-z]:' "$f" 2>/dev/null && src="[desktop] "
+    printf '%s\t%s  %s%s\n' "$f" "$when" "$src" "$title"
+  done
+}
+
+session_preview() {   # $1 = transcript: the last few messages
+  [ -f "$1" ] || return 0
+  printf '%s\n\n' "$(session_title "$1")"
+  tail -n 600 "$1" | jq -r "$JQ_TEXT"' | "\(if .[0] == "user" then "YOU" else "CLAUDE" end): \(.[1] | gsub("\\s+"; " ") | .[0:400])"' 2>/dev/null \
+    | tail -n 12 | sed 's/$/\n/'
+}
+
+pick_session() {   # $1 = folder: prints the chosen session id, or nothing for a new one
+  local list sel n
+  list=$(mktemp)
+  session_rows "$1" > "$list"
+  if [ ! -s "$list" ]; then rm -f "$list"; return 0; fi
+  # Numbered rows: the number maps back to the transcript, whatever fzf prints
+  sel=$( { echo "0  [ New conversation ]"; cut -f2- "$list" | awk '{ print NR "  " $0 }'; } \
+    | fzf --reverse --height=80% --no-sort \
+          --prompt="$(basename "$1") > " \
+          --header="$(basename "$1"): pick a conversation to resume, or start a new one (Esc = new)" \
+          --preview "f=\$(sed -n '{1}p' '$list' | cut -f1); [ -n \"\$f\" ] && spawn --session-preview \"\$f\"" \
+          --preview-window=down,55%,wrap)
+  n=$(printf '%s' "$sel" | awk 'NR == 1 { print $1 }')
+  if [[ "$n" =~ ^[1-9][0-9]*$ ]]; then basename "$(sed -n "${n}p" "$list" | cut -f1)" .jsonl; fi
+  rm -f "$list"
 }
 
 # ---- Doctor ------------------------------------------------------
@@ -240,6 +334,13 @@ doctor() {
 
   if [ -n "$WSL_DISTRO_NAME" ]; then
     if [ -e "${WIN_PY:-}" ]; then ok "winpy -> $WIN_PY"; else meh "winpy: Windows Python not found at '${WIN_PY:-}'"; fi
+    if win_projects >/dev/null && ! command -v rsync >/dev/null; then
+      bad "rsync is missing, so Claude Desktop sessions can't be brought into WSL: sudo dnf install rsync"
+    elif win_projects >/dev/null; then
+      local pend; pend=$(import_desktop dry)
+      if [ "${pend:-0}" -gt 0 ]; then meh "$pend Claude Desktop session(s) not in WSL yet: spawn --import-desktop (or they come over before -R / -r)"
+      else ok "Claude Desktop sessions are all visible in WSL"; fi
+    fi
   elif command -v fc-list >/dev/null; then
     if fc-list | grep -qi 'MesloLGS NF'; then ok "MesloLGS NF font"; else meh "MesloLGS NF font not found (prompt icons may look off)"; fi
   fi
@@ -579,6 +680,10 @@ for ((i = 0; i < ${#argv[@]}; i++)); do
     --no-manager|--no-review) REVIEW=0 ;;
     --manager-feed) manager_feed; exit 0 ;;
     --close)     CLOSE=1 ;;
+    --sessions)  PICK=1 ;;
+    --no-sessions) PICK=0 ;;
+    --import-desktop) import_desktop; exit $? ;;
+    --session-preview) session_preview "${argv[$((i + 1))]:-}"; exit 0 ;;
     --prompt)    i=$((i + 1)); PROMPT="${argv[$i]:-}"; [ -n "$PROMPT" ] || die "--prompt needs text" ;;
     --prompt-file) i=$((i + 1)); PROMPT_FILE="${argv[$i]:-}"; [ -n "$PROMPT_FILE" ] || die "--prompt-file needs a file name" ;;
     --overview)  overview; exit $? ;;
@@ -615,13 +720,14 @@ set -- "${args[@]}"
 if [ $SEND -eq 1 ]; then send_msg; exit 0; fi
 
 # Short options (-k is accepted for compatibility; keeping the pane is the default)
-while getopts ":gx:b:c:rd:s:tkp:h" opt; do
+while getopts ":gx:b:c:rRd:s:tkp:h" opt; do
   case $opt in
     g) GH=1 ;;
     x) SUFFIX="$OPTARG" ;;
     b) BASE="$OPTARG" ;;
     c) CMD="$OPTARG" ;;
     r) CMD="claude --continue || claude" ;;
+    R) PICK=1 ;;
     d) DEPTH="$OPTARG" ;;
     s) SESSION="$OPTARG" ;;
     t) TABS=1 ;;
@@ -718,6 +824,25 @@ if [ "$WT" -eq 0 ]; then
   done
 fi
 [ ${#DIRS[@]} -eq 0 ] && exit 1
+
+# ---- Past conversations: bring Desktop ones over, pick one per folder --
+if [ "$WT" -eq 0 ] && { [ "$PICK" = 1 ] || [[ "$CMD" == *--continue* ]]; } && [ "${AUTO_IMPORT_DESKTOP:-1}" = 1 ]; then
+  import_desktop quiet
+fi
+if [ "$PICK" = 1 ] && [ "$WT" -eq 0 ]; then
+  if [ -n "$PROMPT$PROMPT_FILE" ]; then
+    warn "--prompt starts new conversations, so -R is skipped."
+  elif [[ "$CMD" != claude* ]]; then
+    warn "-R picks Claude conversations, so it's skipped with -c."
+  elif [ ! -t 0 ] || ! command -v fzf >/dev/null || ! command -v jq >/dev/null; then
+    warn "-R needs a terminal, fzf, and jq, so it's skipped."
+  else
+    for k in "${!DIRS[@]}"; do
+      sid=$(pick_session "${DIRS[$k]}")
+      [ -n "$sid" ] && CMDS[k]="claude --resume $sid"
+    done
+  fi
+fi
 
 # ---- Starting prompts ----------------------------------------------
 if [ -n "$PROMPT" ] || [ -n "$PROMPT_FILE" ]; then
