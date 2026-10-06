@@ -100,6 +100,7 @@ WORKFLOW_KEEP_FAILED=${WORKFLOW_KEEP_FAILED:-1}
 WORKFLOW_KEEP_DAYS=${WORKFLOW_KEEP_DAYS:-3}
 REVIEW_KEEP_DAYS=${REVIEW_KEEP_DAYS:-30}
 PICK_SESSIONS=${PICK_SESSIONS:-0}
+MANAGER_WHEN=${MANAGER_WHEN:-handoff}
 AUTO_IMPORT_DESKTOP=${AUTO_IMPORT_DESKTOP:-1}
 EOF
 if [ $IS_WSL -eq 1 ]; then
@@ -250,6 +251,12 @@ else
     warn "  echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/60-agent-grid.conf && sudo sysctl --system"
   fi
   echo "Restart any Claude sessions that were already open so they pick up the hooks."
+fi
+
+# /handoff: hands an analyst's finished work to the manager (ours only; yours are kept)
+mkdir -p ~/.claude/commands
+if [ ! -f ~/.claude/commands/handoff.md ] || grep -q 'installed by agent-grid' ~/.claude/commands/handoff.md; then
+  cp "$ROOT/config/commands/handoff.md" ~/.claude/commands/handoff.md
 fi
 
 CM=~/.claude/CLAUDE.md; touch "$CM"

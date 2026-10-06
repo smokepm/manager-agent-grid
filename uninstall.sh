@@ -15,6 +15,7 @@ echo "removed shell and tmux hooks"
 S=~/.claude/settings.json
 if [ -f "$S" ] && command -v jq >/dev/null && jq empty "$S" 2>/dev/null; then
   t=$(mktemp)
+  grep -qs 'installed by agent-grid' ~/.claude/commands/handoff.md && rm -f ~/.claude/commands/handoff.md
   jq 'def strip: map(select(([.hooks[]?.command] | any(test("auto-commit|agent-hook"))) | not));
       reduce ("Stop", "Notification", "UserPromptSubmit", "PreToolUse") as $e (.;
         if (.hooks[$e] // null) then .hooks[$e] |= strip else . end

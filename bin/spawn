@@ -273,7 +273,11 @@ doctor() {
   done
 
   if [ -f "$CONF" ]; then
-    ok "config: autostart=${TMUX_AUTOSTART:-0}, session=${TMUX_SESSION:-grid}, gh owner=${GH_ORG:-your account}"
+    ok "config: autostart=${TMUX_AUTOSTART:-0}, session=${TMUX_SESSION:-grid}, gh owner=${GH_ORG:-your account}, manager tests ${MANAGER_WHEN:-handoff}"
+    if [ "${MANAGER_WHEN:-handoff}" != every-turn ]; then
+      if [ -f "$HOME/.claude/commands/handoff.md" ]; then ok "/handoff command installed"
+      else meh "/handoff command missing (re-run install.sh); analysts can still hand off themselves"; fi
+    fi
   else meh "no config yet (install.sh creates $(short "$CONF"))"; fi
   if grep -q 'agent-grid' ~/.tmux.conf 2>/dev/null; then ok "~/.tmux.conf loads agent-grid"
   else bad "~/.tmux.conf doesn't load agent-grid (re-run install.sh)"; fi

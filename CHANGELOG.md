@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.18.0 (2026-10-06)
+
+- **Handoff:** the manager no longer tests every turn. Analysts work through the whole task, then hand off by ending their reply with `HANDOFF: ready for the manager` (they're told to at the start of each session). You can hand off for them with `/handoff` or `Ctrl+b H`. Fix rounds after a handoff are tested on their own. `MANAGER_WHEN=every-turn` restores the old behavior.
+- **No pointless rounds:** when the analyst answers a send-back without changing any code or workflow, it comes straight to you with its reply instead of rerunning the same test. This happens in both modes.
+- New: a `/handoff` command in `~/.claude/commands/` (installed by `install.sh`, removed by `uninstall.sh`), and `spawn --doctor` shows which mode the manager is in.
+
 ## 0.17.0 (2026-10-05)
 
 - **Pick up past conversations:** `spawn -R` (or `--sessions`) asks, for each folder you pick, which past Claude conversation to resume: newest first, titled with Claude's summary or your first message, with a preview of the last few messages, or a new one. Workspaces remember `-R`, and `PICK_SESSIONS=1` makes it the default.

@@ -189,7 +189,7 @@ Good checks compare outputs against known-good results: tests, a reconciliation 
 
 Every `spawn` comes with a manager. You'll see a pane labeled **manager**, and agent panes marked **[managed]**. The agents doing the work are the analysts. The manager's only job is to refute or break their work.
 
-Each review is done by a fresh Claude, started when an analyst finishes a turn that changed something. That's deliberate: a reviewer that sat through the analyst's reasoning tends to adopt it, while a fresh one sees only the work, your checks, and a written record of earlier rounds (see below). The manager pane is the shared view of all of it.
+Each review is done by a fresh Claude, started when an analyst hands off its finished work (see below). That's deliberate: a reviewer that sat through the analyst's reasoning tends to adopt it, while a fresh one sees only the work, your checks, and a written record of earlier rounds (see below). The manager pane is the shared view of all of it.
 
 #### Workflows: the analyst's hand-off
 
@@ -201,7 +201,7 @@ A workflow is a repeatable run the manager can execute: a build, a test run, a r
   WORKFLOW.md   Purpose, Inputs, Outputs, Correct means, Edge cases
 ```
 
-Analysts are told about this at the start of each managed session. Changing code without a workflow sends the turn back.
+Analysts are told about this at the start of each managed session. A handoff that changed code without a workflow goes back for one.
 
 #### Your checks: the answer key
 
@@ -273,7 +273,24 @@ A **plugin** goes further, for a checker that applies to a whole kind of project
 
 `spawn --doctor` lists the plugins it finds, and `agent-check` runs their checks along with yours.
 
-#### What happens when an analyst finishes a turn
+#### Handoff: the manager checks finished work
+
+The analyst works through the whole task at its own pace; nothing is tested while it works. When the task is done, it hands off: it makes sure its workflows are current, summarizes what it changed, and ends its reply with:
+
+```
+HANDOFF: ready for the manager
+```
+
+Analysts are told to do this at the start of each managed session. You can also hand off for them: type `/handoff` in the analyst's pane, or press `Ctrl+b H`. Then the test below runs once.
+
+- **Fix rounds happen on their own.** If the manager sends problems back, the analyst's next finished turn is tested again, without another handoff, until the work passes or comes to you.
+- **A reply without a code change comes to you.** If the analyst answers findings without changing any code or workflow (it disagrees, or the fix needs something only you can change, like your checks), running the same test again would give the same result. So the pane shows **[manager flagged]** and the log has the analyst's reply, instead of another round.
+- **A new instruction is new work.** Anything you type other than `/handoff` cancels a pending handoff; the analyst hands off again when it's done.
+- **Nothing is pushed until a handoff passes**, with `--gh`.
+
+To test every turn that changed something instead, the way agent-grid used to, set `MANAGER_WHEN=every-turn`.
+
+#### What happens at a handoff
 
 1. **Checks.** `verify.sh` runs, if the folder has one.
 2. **Workflow checks.** These cost nothing and run before anything else:
@@ -349,7 +366,7 @@ The manager pane shows each agent's status in plain words with its last result (
 
 #### Costs and limits
 
-A test reruns your processes several times and uses your Claude plan, so expect several minutes and some usage per finished turn that changed something. `WORKFLOW_TIMEOUT` caps each run and `TEST_TIMEOUT` caps the manager. To make the manager opt-in, set `REVIEW_DEFAULT=0` and launch with `spawn --manager` when you want it.
+A test reruns your processes several times and uses your Claude plan, so expect several minutes and some usage per handoff (or per changed turn, with `MANAGER_WHEN=every-turn`). `WORKFLOW_TIMEOUT` caps each run and `TEST_TIMEOUT` caps the manager. To make the manager opt-in, set `REVIEW_DEFAULT=0` and launch with `spawn --manager` when you want it.
 
 ### Orchestration
 
@@ -373,6 +390,7 @@ Press `Ctrl+b`, release, then:
 | `G` | Same, in GitHub mode (`spawn --gh`) |
 | `O` | Overview of every agent, most urgent first; Enter jumps to it |
 | `M` | Send a message to agents |
+| `H` | Hand the analyst in this pane off to the manager (types `/handoff`) |
 | `W` | Watch this agent's manager live, in a split beside it |
 | `z` | Zoom this pane / back to the grid |
 | arrows | Move between panes (or click) |
@@ -401,6 +419,7 @@ Settings live in `~/.config/agent-grid/config`; workspaces in `~/.config/agent-g
 | `VERIFY_MAX` | How many times a failing check goes back to Claude (default 3) |
 | `VERIFY_TIMEOUT` | Seconds a check may run (default 600) |
 | `REVIEW_DEFAULT` | `1` (default) launches the manager with every spawn, `0` makes it opt-in |
+| `MANAGER_WHEN` | `handoff` (default): the manager tests once the analyst hands off its finished work. `every-turn`: it tests every turn that changed something |
 | `REVIEW_MAX` | Rounds the manager's findings go back to the analyst (default 2) |
 | `REVIEW_TIMEOUT` | Seconds a read-only review may take (default 300) |
 | `REVIEW_MODEL` | Model for the manager (blank = your default) |

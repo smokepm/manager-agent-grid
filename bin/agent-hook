@@ -117,7 +117,7 @@ auto_push() {
   CLAUDE_PROJECT_DIR="$DIR" "$HOME/.local/bin/auto-commit" >/dev/null 2>&1 || true
 }
 
-block() { jq -n --arg r "$1" '{decision: "block", reason: $r}'; }
+block() { touch "$STATE/sentback-$KEY"; jq -n --arg r "$1" '{decision: "block", reason: $r}'; }
 
 # Retry counts per folder
 bump() { local f="$STATE/$1-$KEY.tries" n; n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$f"; echo "$n"; }
@@ -836,7 +836,10 @@ review_enabled() { [ "${AGENT_GRID_REVIEW:-0}" = 1 ] || [ -f "$AG/review.md" ]; 
 run_manager() {   # returns 0 = passed/skipped, 1 = blocked, 2 = handed to you
   review_enabled || return 0
   local wfs problems
-  needs_test || return 0
+  if ! needs_test; then
+    ! per_turn && log "manager: handed off, but nothing changed since the last passing test"
+    return 0
+  fi
 
   mapfile -t wfs < <(list_workflows)
   if [ ${#wfs[@]} -eq 0 ]; then
@@ -881,25 +884,75 @@ run_manager() {   # returns 0 = passed/skipped, 1 = blocked, 2 = handed to you
 }
 
 # Findings that came back while the analyst was busy
-# ---- Stop --------------------------------------------------------
-handle_stop() {
-  local rc; TESTED=0
-  capture_reply
-  run_verify; case $? in 1|2) return ;; esac          # never push work that fails checks
-  run_manager; rc=$?
-  prune
-  case $rc in 1|2) return ;; esac                     # or that the manager hasn't passed
+# ---- Handoff -----------------------------------------------------
+# By default the manager doesn't test every turn. The analyst works through the whole
+# task and hands off when it's done: it ends its reply with "HANDOFF: ready for the
+# manager", or you type /handoff (Ctrl+b H). From then until the work passes or comes to
+# you, every finished turn is tested, so fix rounds happen on their own.
+# MANAGER_WHEN=every-turn tests every turn that changed something, as before.
+HANDOFF_FLAG() { echo "$STATE/handoff-$KEY"; }
+per_turn() { [ "${MANAGER_WHEN:-handoff}" = every-turn ]; }
+handed_off_now() { jget .last_assistant_message | grep -qiE '^[[:space:]*_>#`-]*handoff:'; }
+end_round() { rm -f "$(HANDOFF_FLAG)" "$STATE/sentback-$KEY"; }
+
+# After a send-back, did the analyst change any code or workflow, or only reply?
+code_changed_since() {   # $1 = stamp
+  [ -n "$(find "$DIR" -type f -newer "$1" -not -path '*/.git/*' -not -path '*/node_modules/*' \
+          -not -path '*/__pycache__/*' -not -path '*/.scratch/*' \
+          \( -path "$WFDIR/*" -o -regextype posix-extended -regex ".*\.($CODE_ONLY|json|yaml|yml|ini|cfg|bat|ps1)$" \) \
+          -print -quit 2>/dev/null)" ]
+}
+
+finished_turn() {   # not tested: the analyst is still working
   set_status "done"
   if ! looking; then
     local last; last=$(jget .last_assistant_message | tr '\n' ' ' | cut -c1-140)
     notify "$name finished" "${last:-Claude finished its turn.}"
   fi
+}
+
+# ---- Stop --------------------------------------------------------
+handle_stop() {
+  local rc; TESTED=0
+  capture_reply
+
+  # Sent back, and the analyst answered without changing any code: running the same test
+  # again would give the same result, so it's yours now, with the analyst's reply
+  if [ -f "$STATE/sentback-$KEY" ] && ! code_changed_since "$STATE/sentback-$KEY"; then
+    local reply; reply=$(jget .last_assistant_message | tr '\n' ' ' | cut -c1-240)
+    end_round; reset_tries review; reset_tries workflow; reset_tries verify; rm -f "$STATE/wfsent-$KEY"
+    log "manager: the analyst replied without changing any code, so it's handed to you instead of another round${reply:+. Its reply: $reply}"
+    set_status flagged
+    notify "$name: needs you" "The analyst disagrees or can't fix it without you. Read its reply in the pane."
+    return
+  fi
+
+  # Handoff mode: nothing is tested (or pushed) until the analyst hands off
+  if review_enabled && ! per_turn && [ ! -f "$(HANDOFF_FLAG)" ]; then
+    if handed_off_now; then
+      touch "$(HANDOFF_FLAG)"
+      log "manager: the analyst handed off; testing"
+    else
+      finished_turn; return
+    fi
+  fi
+
+  run_verify; rc=$?
+  case $rc in 1) return ;; 2) end_round; return ;; esac     # never push work that fails checks
+  run_manager; rc=$?
+  prune
+  case $rc in 1) return ;; 2) end_round; return ;; esac     # or that the manager hasn't passed
+  end_round
+  finished_turn
   # Push only what was tested: a hand edit during the test waits for the next one
   if [ "$TESTED" = 1 ] && changed_since "$STATE/started-$KEY"; then
     log "manager: not pushing; the folder changed while it was being tested, so the next test covers it"
   else auto_push; fi
 }
 
+BRIEFING_HANDOFF='agent-grid: you are an analyst agent with a manager. Work through the whole task at your own pace: the manager does not check each turn. When the task is finished (not after each step), hand off: make sure every process your code runs has an up-to-date workflow (below), give a short summary of what you changed and anything you are unsure of, and end your reply with this line exactly:
+HANDOFF: ready for the manager
+The manager then runs every workflow in a copy of this folder, runs the user'"'"'s checks (.agent-grid/checks.toml), and tries to refute or break your work. Problems come back to you: fix them and finish again, or, if you are confident a finding is wrong, explain why without changing anything and it goes to the user. The user'"'"'s checks are read-only to you: agent-grid blocks edits to them.'
 BRIEFING='agent-grid: you are an analyst agent with a manager. When you finish a turn that changed code, the manager runs every workflow in .agent-grid/workflows/ in a copy of this folder, runs the user'"'"'s checks (.agent-grid/checks.toml), and tries to refute or break your work. Problems come back to you. If there is no workflow for the code you change, your turn is sent back. The user'"'"'s checks are read-only to you: agent-grid blocks edits to them.'
 
 # ---- Before a tool runs: your files stay yours -------------------
@@ -1023,6 +1076,11 @@ fi
 case "$event" in
   UserPromptSubmit)
     set_status working
+    if review_enabled && ! per_turn; then
+      if jget .prompt | grep -qE '^[[:space:]]*/handoff\b'; then touch "$(HANDOFF_FLAG)"
+      else rm -f "$(HANDOFF_FLAG)"; fi
+    fi
+    rm -f "$STATE/sentback-$KEY"   # you answered, so the next turn is new work, not a bare reply
     brief="$STATE/briefed-$KEY-${session:-none}"
     if review_enabled && [ ! -f "$brief" ]; then
       touch "$brief"
@@ -1034,7 +1092,8 @@ case "$event" in
         log "manager: starting point set; the analyst's changes from now on are reviewed"
       fi
       find "$STATE" -maxdepth 1 -name 'briefed-*' -mtime +7 -delete 2>/dev/null
-      printf '%s\n\n%s\n' "$BRIEFING" "$WORKFLOW_HELP"
+      if per_turn; then printf '%s\n\n%s\n' "$BRIEFING" "$WORKFLOW_HELP"
+      else printf '%s\n\n%s\n' "$BRIEFING_HANDOFF" "$WORKFLOW_HELP"; fi
     fi ;;
   Notification)
     ntype=$(jget .notification_type)
