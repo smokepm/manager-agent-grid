@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.19.0 (2026-10-28)
+
+- **A review that doesn't finish isn't a pass.** When a folder is too big to copy, the manager reviews the changes read-only. If that review ran out of time, gave no verdict, or couldn't start, the work counted as passed and was pushed. Now it comes to you (**[manager flagged]** and a notification), and nothing is pushed.
+- **Analysts check before handing off.** `/handoff` and the start-of-session briefing tell analysts to run each workflow and then `agent-check` first, so a failing check costs seconds instead of a round.
+- **Full paths stopped where they're written.** An analyst's edit that puts the folder's full path in a workflow or code file is blocked right away, instead of costing a test round. The full-path check skips `_archive` folders, since their files don't run.
+- **Manager pane:** findings wrap to the pane's width, with bullets indented, and `**bold**` shows as bold instead of asterisks.
+- **tmux defaults for Claude Code:** `allow-passthrough` and extended keys, so Shift+Enter adds a newline and Claude's notifications and progress bar reach the outer terminal.
+- Rerun `install.sh` to update the installed `/handoff` command.
+
 ## 0.18.0 (2026-10-06)
 
 - **Handoff:** the manager no longer tests every turn. Analysts work through the whole task, then hand off by ending their reply with `HANDOFF: ready for the manager` (they're told to at the start of each session). You can hand off for them with `/handoff` or `Ctrl+b H`. Fix rounds after a handoff are tested on their own. `MANAGER_WHEN=every-turn` restores the old behavior.

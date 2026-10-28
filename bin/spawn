@@ -596,6 +596,35 @@ feed_agents() {   # $1 = the hook's log
     done | sort -t $'\t' -k1,1n | cut -f2-
 }
 
+# Wrap markdown to $1 columns, with a hanging indent under bullets; **text** shows as bold
+wrap_md() {
+  awk -v w="$1" '{
+    match($0, /^ */); ind = substr($0, 1, RLENGTH)
+    hang = ind (substr($0, RLENGTH + 1) ~ /^([-*]|[0-9]+\.) / ? "  " : "")
+    n = split(substr($0, RLENGTH + 1), words, " ")
+    line = ind; vis = start = length(ind)
+    for (i = 1; i <= n; i++) {
+      word = words[i]; plain = word; gsub(/\*\*/, "", plain)
+      if (vis > start && vis + 1 + length(plain) > w) {
+        print line (bold ? "\033[22m" : ""); line = hang (bold ? "\033[1m" : ""); vis = start = length(hang)
+      }
+      out = ""
+      while ((p = index(word, "**")) > 0) { out = out substr(word, 1, p - 1) (bold ? "\033[22m" : "\033[1m"); bold = !bold; word = substr(word, p + 2) }
+      line = line (vis > start ? " " : "") out word; vis += (vis > start ? 1 : 0) + length(plain)
+    }
+    print line (bold ? "\033[22m" : ""); bold = 0 }'
+}
+# Clip lines to $1 columns (color codes take no space) and keep the first $2 lines
+fit() {
+  awk -v w="$1" -v h="$2" 'NR > h { exit } {
+    out = ""; n = 0; s = $0
+    while (s != "" && n < w) {
+      if (match(s, /^\033\[[0-9;]*m/)) { out = out substr(s, 1, RLENGTH); s = substr(s, RLENGTH + 1) }
+      else { out = out substr(s, 1, 1); s = substr(s, 2); n++ }
+    }
+    print out (s != "" ? "\033[0m" : "") }'
+}
+
 manager_feed() {
   local hlog="$STATE_DIR/agent-hook.log" key latest cols rows frame lines here
   trap 'tput cnorm 2>/dev/null; exit 0' INT TERM
@@ -627,12 +656,12 @@ manager_feed() {
       else echo "  nothing yet"; fi
       if [ -n "$latest" ]; then
         printf '\n\033[1mLatest findings\033[0m (%s)\n' "$(head -n 1 "$latest" | sed 's/^# Review of //; s|.*/||')"
-        sed '1,2d' "$latest" | grep -v 'VERDICT:' | grep -v '^[[:space:]]*$' | head -n 12 | sed 's/^/  /'
+        sed '1,2d' "$latest" | grep -v 'VERDICT:' | grep -v '^[[:space:]]*$' | head -n 12 | wrap_md $((cols - 2)) | sed 's/^/  /'
       fi
     )
     clear
     # Fit the pane: trim width and height
-    printf '%s\n' "$frame" | cut -c1-"$cols" | head -n $((rows - 1))
+    printf '%s\n' "$frame" | fit "$cols" $((rows - 1))
     if read -rsn1 -t 3 key; then
       case "$key" in
         o) tput cnorm 2>/dev/null; overview; tput civis 2>/dev/null ;;

@@ -295,7 +295,7 @@ To test every turn that changed something instead, the way agent-grid used to, s
 1. **Checks.** `verify.sh` runs, if the folder has one.
 2. **Workflow checks.** These cost nothing and run before anything else:
    - each workflow has both files and a "Correct means" section;
-   - nothing refers to the folder by its full path, which would make a test in a copy touch the real files.
+   - nothing refers to the folder by its full path, which would make a test in a copy touch the real files. Files in `_archive` folders are skipped, since they don't run. Analysts are also stopped from writing the full path into a workflow or code file in the first place.
 
    Problems go back to the analyst.
 3. **Snapshot.** The folder is copied as it is right now. Folders on a Windows drive under WSL get their copy on the Windows side, so `winpy` and Excel can open the files.
@@ -476,6 +476,7 @@ Start with `spawn --doctor`. It names the problem and the fix for most of these.
 | Turns keep coming back about a missing workflow | The analyst changed code without a workflow. Ask it to write `.agent-grid/workflows/<name>/` (see The manager) |
 | A workflow passes for the analyst but fails for the manager | It probably depends on something outside the folder, or on `.git`/a venv that isn't copied. Open `<folder>-last-failed` in the temp folder and run its `run.sh` |
 | "couldn't finish testing" | Raise `TEST_TIMEOUT` or `WORKFLOW_TIMEOUT`, or split a long run into smaller workflows |
+| "couldn't finish its review" | The folder was too big to copy, so the manager could only read the changes, and ran out of time. Nothing was pushed. Raise `REVIEW_TIMEOUT`, or make the folder smaller than `WORKFLOW_COPY_MAX_MB` so its workflows get a real test |
 | "Your checks ... changed since the last test" and you didn't change them | An analyst edited them. Restore your copy (or `git checkout .agent-grid/checks.toml`) and tell the analyst |
 | "checks.toml can't be used" | Run `agent-check plan` in the folder to see why: often a missing file or a misspelled setting |
 | Doctor says bubblewrap can't run (Ubuntu 24.04+) | `echo 'kernel.apparmor_restrict_unprivileged_userns=0' \| sudo tee /etc/sysctl.d/60-agent-grid.conf && sudo sysctl --system`, or `CONTAIN=0` |

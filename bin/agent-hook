@@ -45,6 +45,8 @@ mkdir -p "$STATE/reviews"; chmod 700 "$STATE" 2>/dev/null
 CODE_INC=(); for e in ${CODE_ONLY//|/ } json yaml yml ini cfg bat ps1; do CODE_INC+=(--include="*.$e"); done
 SKIP_DIRS=(--exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.venv --exclude-dir=venv
            --exclude-dir=__pycache__ --exclude-dir=worktrees)
+# The full-path check also skips _archive folders: archived files don't run
+PATH_SKIP=("${SKIP_DIRS[@]}" --exclude-dir=_archive)
 
 # ---- Folder and pane --------------------------------------------
 DIR=""; KEY=""; AG=""; WFDIR=""; SROOT=""; pane=""; name=""; session=""
@@ -290,7 +292,7 @@ check_workflows() {   # $@ = workflow names; prints problems, empty if fine
   done
   # The folder's own full path would make a test in a copy touch the real files
   command -v wslpath >/dev/null && e=$(wslpath -w "$DIR" 2>/dev/null) && [ -n "$e" ] && pats+=(-e "$e")
-  { grep -rliF "${pats[@]}" "${SKIP_DIRS[@]}" "${CODE_INC[@]}" --exclude-dir=.agent-grid "$DIR" 2>/dev/null
+  { grep -rliF "${pats[@]}" "${PATH_SKIP[@]}" "${CODE_INC[@]}" --exclude-dir=.agent-grid "$DIR" 2>/dev/null
     grep -rliF "${pats[@]}" "$WFDIR" --exclude='*.md' 2>/dev/null; } \
     | sed "s|^$DIR/||" | sort -u | head -n 10 | sed 's/^/- uses the folder'"'"'s full path (use a path relative to the folder root): /'
 }
@@ -797,7 +799,10 @@ read_only_review() {   # folders where no code changed and there are no workflow
   fi
   changes=$(collect_changes | head -c 80000)
   [ -n "$(printf '%s' "$changes" | tr -d '[:space:]')" ] || return 0
-  cb=$(claude_bin); [ -x "$cb" ] || { log "manager: skipped (claude not found)"; return 0; }
+  # A review that doesn't happen or doesn't finish isn't a pass: it comes to you, and nothing is pushed
+  cb=$(claude_bin); [ -x "$cb" ] || {
+    log "manager: couldn't review, handed back to you: claude wasn't found"
+    set_status flagged; notify "$name: manager needs you" "Claude wasn't found, so nothing was reviewed. Nothing was pushed."; return 2; }
   set_status reviewing
   out=$(cd "$DIR" && printf '%s%s\n\n--- CHANGES ---\n%s\n' "$READ_PROMPT" "$(folder_rules)" "$changes" \
         | AGENT_GRID_NESTED=1 AGENT_GRID_AUTOPUSH=0 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 timeout "$(cap "${REVIEW_TIMEOUT:-300}")" \
@@ -807,7 +812,11 @@ read_only_review() {   # folders where no code changed and there are no workflow
   verdict=$(printf '%s\n' "$out" | grep -oE 'VERDICT: *(PASS|FAIL)' | tail -n 1 | grep -oE 'PASS|FAIL')
   RESULT_FILE=$(review_file); printf '# Review of %s\n\n%s\n' "$DIR" "$out" > "$RESULT_FILE"
   if [ $rc -ne 0 ] || [ -z "$verdict" ]; then
-    log "manager: couldn't finish its review (exit $rc), skipped. See ${RESULT_FILE/#$HOME/$TILDE}"; return 0
+    if [ "$rc" = 124 ]; then text="The manager ran out of time (REVIEW_TIMEOUT)."
+    elif [ "$rc" = 0 ]; then text="The manager stopped without giving a verdict."
+    else text="The manager stopped with an error (exit $rc)."; fi
+    log "manager: couldn't finish its review, handed back to you. $text See ${RESULT_FILE/#$HOME/$TILDE}"
+    set_status flagged; notify "$name: manager needs you" "$text Nothing was pushed."; return 2
   fi
   if [ "$verdict" = PASS ]; then
     reset_tries review; log "manager: read-only review found no problems (no workflow, so nothing was run)"
@@ -950,7 +959,7 @@ handle_stop() {
   else auto_push; fi
 }
 
-BRIEFING_HANDOFF='agent-grid: you are an analyst agent with a manager. Work through the whole task at your own pace: the manager does not check each turn. When the task is finished (not after each step), hand off: make sure every process your code runs has an up-to-date workflow (below), give a short summary of what you changed and anything you are unsure of, and end your reply with this line exactly:
+BRIEFING_HANDOFF='agent-grid: you are an analyst agent with a manager. Work through the whole task at your own pace: the manager does not check each turn. When the task is finished (not after each step), hand off: make sure every process your code runs has an up-to-date workflow (below), if .agent-grid/checks.toml exists run each workflow'"'"'s run.sh and then agent-check from the folder root and fix anything that fails (the manager runs the same checks first, so a failure there costs a whole round), give a short summary of what you changed and anything you are unsure of, and end your reply with this line exactly:
 HANDOFF: ready for the manager
 The manager then runs every workflow in a copy of this folder, runs the user'"'"'s checks (.agent-grid/checks.toml), and tries to refute or break your work. Problems come back to you: fix them and finish again, or, if you are confident a finding is wrong, explain why without changing anything and it goes to the user. The user'"'"'s checks are read-only to you: agent-grid blocks edits to them.'
 BRIEFING='agent-grid: you are an analyst agent with a manager. When you finish a turn that changed code, the manager runs every workflow in .agent-grid/workflows/ in a copy of this folder, runs the user'"'"'s checks (.agent-grid/checks.toml), and tries to refute or break your work. Problems come back to you. If there is no workflow for the code you change, your turn is sent back. The user'"'"'s checks are read-only to you: agent-grid blocks edits to them.'
@@ -961,6 +970,20 @@ BRIEFING='agent-grid: you are an analyst agent with a manager. When you finish a
 # sees the message. A script that writes there anyway is still caught at the next test.
 PROTECTED=""   # set in pre_tool, from protect_list
 deny() { printf 'agent-grid: %s\n' "$1" >&2; exit 2; }
+full_path_scanned() {   # $1 = path in the folder: would check_workflows look in it for the full path?
+  local d
+  case "$1" in .agent-grid/workflows/*.md) return 1 ;; .agent-grid/workflows/*) return 0 ;; .agent-grid/*) return 1 ;; esac
+  for d in "${PATH_SKIP[@]#--exclude-dir=}"; do case "/$1" in */"$d"/*) return 1 ;; esac; done
+  [[ "$1" =~ \.(${CODE_ONLY}|json|yaml|yml|ini|cfg|bat|ps1)$ ]]
+}
+full_path_in_edit() {   # the text an Edit, Write, or MultiEdit adds names the folder's full path
+  local text e
+  text=$(printf '%s' "$input" | jq -r '[.tool_input.content, .tool_input.new_string, .tool_input.edits[]?.new_string]
+           | map(select(. != null)) | join("\n")' 2>/dev/null)
+  [ -n "$text" ] || return 1
+  printf '%s' "$text" | grep -qiF -e "$DIR" && return 0
+  command -v wslpath >/dev/null && e=$(wslpath -w "$DIR" 2>/dev/null) && [ -n "$e" ] && printf '%s' "$text" | grep -qiF -e "$e"
+}
 pre_tool() {
   local tool p rel cmd cwd ins
   tool=$(jget .tool_name)
@@ -987,6 +1010,11 @@ pre_tool() {
       [ "$rel" != "$p" ] || return 0
       if printf '%s' "$rel" | grep -qiE "^${PROTECTED}"; then
         deny "$rel belongs to the user (their checks, their own tests, known-good results, or folder rules), so analysts can't change it. If you believe it's wrong, stop and explain why in your reply. Don't change the code to fit it either."
+      fi
+      # The same full-path rule check_workflows applies at test time, caught now instead
+      # of a whole test round later
+      if full_path_scanned "$rel" && full_path_in_edit; then
+        deny "that puts this folder's full path in $rel. Workflows are tested in a copy of the folder, so a full path would read or write the real files. Use a path relative to the folder root (run.sh runs from there)."
       fi ;;
     Bash)
       cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)
