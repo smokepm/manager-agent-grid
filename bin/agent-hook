@@ -114,6 +114,15 @@ notify() {  # $1 title, $2 body
   return 0
 }
 
+notify_once() {   # $1 title, $2 body; skipped when it repeats this folder's last one (until a pass)
+  local h; h=$(printf '%s\n%s' "$1" "$2" | md5sum | cut -c1-12)
+  if [ "$(cat "$STATE/notified-$KEY" 2>/dev/null)" = "$h" ]; then
+    [ -n "$pane" ] && tmux display-message -d 4000 "agent-grid: $1 (still)" 2>/dev/null
+    return 0
+  fi
+  echo "$h" > "$STATE/notified-$KEY"; notify "$1" "$2"
+}
+
 auto_push() {
   [ -x "$HOME/.local/bin/auto-commit" ] || return 0
   CLAUDE_PROJECT_DIR="$DIR" "$HOME/.local/bin/auto-commit" >/dev/null 2>&1 || true
@@ -257,7 +266,10 @@ WORKFLOW_HELP='Write one workflow for each process the code runs (a build, a tes
 .agent-grid/workflows/<name>/run.sh
   The exact commands that produce the outputs. It runs from the folder root, in a
   copy of this folder, so use paths relative to the folder root. Exit non-zero if
-  any step fails. Name the folder with letters, digits, dot, dash, or underscore.
+  any step fails. If the run must stop until the user decides something (sources
+  disagree, an amount is over its maximum, a rule is unclear), print what needs
+  deciding and exit 3: the manager then hands it to the user instead of back to you.
+  Name the folder with letters, digits, dot, dash, or underscore.
   If .agent-grid/checks.toml names output files (its outputs list, a golden test'"'"'s
   expect, or a file a plugin'"'"'s checks read), the workflow must write them at those paths,
   in that format.
@@ -337,14 +349,17 @@ contain() {   # run "$@" contained, if bubblewrap works here
   if [ "$CONTAINED" != 1 ]; then "$@"; return; fi
   local prot p a=(--ro-bind / / --dev /dev --proc /proc --die-with-parent)
   prot=$(dirname "$DIR"); { [ "$prot" = "$HOME" ] || [ "$prot" = / ]; } && prot="$DIR"
-  # Home stays writable (Claude keeps its session files there), except what's below
-  a+=(--bind "$HOME" "$HOME" --bind /tmp /tmp)
+  # Home stays writable (Claude keeps its session files there), except what's below.
+  # /tmp is the test's own, so nothing a test writes there is left behind or seen outside.
+  a+=(--bind "$HOME" "$HOME" --tmpfs /tmp)
   [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ] && a+=(--bind "$TMPDIR" "$TMPDIR")
   a+=(--ro-bind "$prot" "$prot" --ro-bind "$STATE" "$STATE")
-  # Read-only: agent-grid itself, your checks and settings, Claude's settings, shell setup,
-  # and every plugin's own folder (a plugin linked in from elsewhere keeps its files there)
+  # Read-only: agent-grid itself, your checks and settings, Claude's settings, commands,
+  # skills and agents, shell setup, the Python environment every real run uses, and
+  # every plugin's own folder (a plugin linked in from elsewhere keeps its files there)
   for p in "$CONF_DIR" "$AG_ROOT" "$HOME/.local/bin" "$HOME/.claude/settings.json" \
-           "$HOME/.claude/settings.local.json" "$HOME/.claude/CLAUDE.md" "$HOME/.zshrc" \
+           "$HOME/.claude/settings.local.json" "$HOME/.claude/CLAUDE.md" "$HOME/.claude/commands" \
+           "$HOME/.claude/skills" "$HOME/.claude/agents" "$HOME/.venv" "$HOME/.zshrc" \
            "$HOME/.bashrc" "$HOME/.profile" "$HOME/.tmux.conf" "$HOME/.gitconfig"; do
     [ -e "$p" ] && a+=(--ro-bind "$p" "$p")
   done
@@ -415,7 +430,7 @@ READ_PROMPT='You are the manager of an analyst agent. The analyst just finished 
 
 Do not comment on style, naming, or optional improvements. Do not report problems you are unsure are real.
 
-For each real problem: the file, what is wrong, and a concrete example that breaks it. The last line of your answer must be exactly "VERDICT: PASS" if you found no real problems, or "VERDICT: FAIL" if you did.'
+For each real problem: the file, what is wrong, and a concrete example that breaks it.'
 
 TEST_PROMPT='You are the manager of an analyst agent. The analyst changed the code in this folder and wrote workflows that run it. You are in a disposable copy of the folder: run anything, change any file, create test inputs. Nothing you do here touches the real files. Stay inside this copy, and do not write to any path outside it.
 
@@ -436,9 +451,27 @@ If the user has no checks or no known-good examples yet, test all the harder: yo
 
 Stopping with a clear error on bad input is fine. A wrong result without an error, on any input, is a problem. Input that WORKFLOW.md says is out of scope is not. Do not comment on style, and do not report anything you are not sure of.
 
-For each problem: the workflow, the file, what is wrong, and the expected and actual values or the exact input that shows it.
-Then one line per workflow, exactly "WORKFLOW <name>: PASS" or "WORKFLOW <name>: FAIL".
-The last line must be exactly "VERDICT: PASS" if you found no real problems, or "VERDICT: FAIL" if you did.'
+For each problem: the workflow, the file, what is wrong, and the expected and actual values or the exact input that shows it.'
+
+# Grading (MANAGER_GRADING=1, the default): each problem is BLOCKING or HARDENING, and only
+# BLOCKING ones fail the test. HARDENING ones stay in the saved review for you, without
+# costing the analyst another round. MANAGER_GRADING=0 fails on any problem, as before.
+GRADE_RULE='Grade every problem you report, and start it with its grade.
+BLOCKING: it gives a wrong result on the real inputs in this folder; or it breaks a rule in the folder or user instructions (for example a total or tie-out that the outputs claim but the code never checks, silently choosing between sources that disagree instead of stopping, or an amount over a stated maximum); or it gives a wrong result without an error on input that is realistic for this data (the real inputs already have such cases, or the source format allows them and they would plausibly happen).
+HARDENING: anything else, for example a wrong result only on unlikely made-up input, a crash or unclear message where nothing wrong is written, or out-of-date documentation.
+List the BLOCKING problems first.'
+if [ "${MANAGER_GRADING:-1}" = 1 ]; then
+  FIX_ASK='Fix every BLOCKING one. HARDENING ones are optional: fix them if it is quick, or leave them.'
+  VERDICT_RULE='The last line must be exactly "VERDICT: PASS" if you found no BLOCKING problems (HARDENING problems alone still pass), or "VERDICT: FAIL" if you found at least one.'
+  READ_PROMPT="$READ_PROMPT"$'\n\n'"$GRADE_RULE"$'\n\n'"$VERDICT_RULE"
+  TEST_PROMPT="$TEST_PROMPT"$'\n\n'"$GRADE_RULE"$'\n\nThen one line per workflow, exactly "WORKFLOW <name>: PASS" or "WORKFLOW <name>: FAIL" (FAIL only for a BLOCKING problem).\n'"$VERDICT_RULE"
+else
+  FIX_ASK='Fix the real ones.'
+  VERDICT_RULE='The last line must be exactly "VERDICT: PASS" if you found no real problems, or "VERDICT: FAIL" if you did.'
+  READ_PROMPT="$READ_PROMPT"$'\n\n'"The last line of your answer must be exactly \"VERDICT: PASS\" if you found no real problems, or \"VERDICT: FAIL\" if you did."
+  TEST_PROMPT="$TEST_PROMPT"$'\nThen one line per workflow, exactly "WORKFLOW <name>: PASS" or "WORKFLOW <name>: FAIL".\n'"$VERDICT_RULE"
+fi
+hardening_count() { grep -ciE '^[[:space:]>*_#0-9.-]*(\*\*)?HARDENING'; }
 
 
 claude_bin() { command -v claude || echo "$HOME/.local/bin/claude"; }
@@ -455,11 +488,13 @@ record() {   # $1 workflow, $2 result: one line for the manager pane
 # Each review is a fresh Claude, so it sees only the work, not the analyst's reasoning.
 # What carries over is a written record: earlier findings and the analyst's replies.
 ROUNDS() { echo "$STATE/rounds-$KEY.md"; }
-record_round() {   # $1 = findings sent to the analyst
+record_round() {   # $1 = findings, $2 = where they went (default: sent to the analyst)
   local n; n=$(grep -c '^## Round ' "$(ROUNDS)" 2>/dev/null); n=$(( ${n:-0} + 1 ))
-  printf '## Round %s (%s): findings sent to the analyst\n%s\n\n' "$n" "$(date '+%m-%d %H:%M')" \
+  printf '## Round %s (%s): findings %s\n%s\n\n' "$n" "$(date '+%m-%d %H:%M')" "${2:-sent to the analyst}" \
     "$(printf '%s' "$1" | head -c 5000)" >> "$(ROUNDS)"
 }
+# Findings handed to you stay on the record until a test passes, so the next round re-checks them
+record_handed() { record_round "$1" "handed to the user, not the analyst (still to be re-checked)"; }
 await_reply() { touch "$STATE/awaiting-$KEY"; }
 capture_reply() {   # at Stop: the analyst's answer to the findings it was given
   [ -f "$STATE/awaiting-$KEY" ] || return 0
@@ -475,7 +510,13 @@ capture_reply() {   # at Stop: the analyst's answer to the findings it was given
 }
 clear_rounds() { rm -f "$(ROUNDS)" "$STATE/awaiting-$KEY"; }
 
-HISTORY_PROMPT='This is not the first round. Below are the findings from earlier rounds and the analyst'"'"'s replies. For each earlier finding: check whether it is actually fixed now, by rerunning the input that showed it, and say so in one line. If it is not fixed, report it again. If the analyst disputed it, weigh their argument: report it again only if you can answer that argument with new evidence; otherwise drop it and say why in one line. Do not repeat findings that are fixed. Then test everything else as usual; earlier rounds are not the limit of what to look for.'
+HISTORY_PROMPT='This is not the first round. Below are the findings from earlier rounds and the analyst'"'"'s replies, including any handed to the user instead of the analyst. For each earlier finding: check whether it is actually fixed now, by rerunning the input that showed it, and say so in one line. If it is not fixed, report it again. If the analyst disputed it, weigh their argument: report it again only if you can answer that argument with new evidence; otherwise drop it and say why in one line. Do not repeat findings that are fixed.'
+# Later rounds converge: they re-check what was found, and hunt mainly in what changed
+if [ "${MANAGER_GRADING:-1}" = 1 ]; then
+  HISTORY_PROMPT="$HISTORY_PROMPT"' Then look for new problems, mainly in what changed since the last round (listed below, when known). A new problem in code that did not change since the last round is BLOCKING only if it gives a wrong result on the real inputs or breaks a stated rule; otherwise grade it HARDENING.'
+else
+  HISTORY_PROMPT="$HISTORY_PROMPT"' Then test everything else as usual; earlier rounds are not the limit of what to look for.'
+fi
 
 # ---- Live log, for spawn --watch ---------------------------------
 LIVE() { echo "$STATE/live-$KEY.log"; }
@@ -487,7 +528,7 @@ live() { printf '%s\n' "$*" >> "$(LIVE)"; }
 # PASS_SUMMARY says what a pass covered, in plain words, for the log and the feed.
 RESULT=""; RESULT_MSG=""; RESULT_FILE=""; RESULT_NOTE=""; PASS_SUMMARY=""
 run_test() {
-  local wfs wf rc out t runs="" failed="" marker produced cb verdict changes work="$RUN/work" lockfd="" last
+  local wfs wf rc out t runs="" failed="" waiting="" decision="" marker produced cb verdict changes work="$RUN/work" lockfd="" last
   local parts=()
   mapfile -t wfs < <(list_workflows "$SNAP")
   RESULT=""; RESULT_MSG=""; RESULT_NOTE=""; PASS_SUMMARY=""; RESULT_FILE=$(review_file)
@@ -537,7 +578,11 @@ run_test() {
           bash ".agent-grid/workflows/$wf/run.sh" 2>&1); rc=$?
     produced=$(find "$work" -type f -newer "$marker" -not -path '*/.agent-grid/*' 2>/dev/null | sed "s|^$work/||" | head -n 30)
     [ $rc -eq 124 ] && out="$(printf '%s\n(stopped: ran longer than %s seconds)' "$out" "$t")"
-    [ $rc -ne 0 ] && { failed="$failed $wf"; record "$wf" "FAIL (didn't run)"; }
+    # Exit 3: stopped on purpose until the user decides something; not the analyst's to fix
+    if [ $rc -eq 3 ]; then
+      waiting="$waiting $wf"; record "$wf" "WAITING (your decision)"
+      decision=$(printf '%s\n%s: %s' "$decision" "$wf" "$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -n 3 | tr '\n' ' ')")
+    elif [ $rc -ne 0 ]; then failed="$failed $wf"; record "$wf" "FAIL (didn't run)"; fi
     live "-- ran workflow $wf as written: exit $rc"
     runs="$runs$(printf '\n### %s: exit code %s\nFiles written:\n%s\nLast output:\n%s\n' \
                  "$wf" "$rc" "${produced:-(none)}" "$(printf '%s\n' "$out" | tail -n 40)")"
@@ -547,6 +592,12 @@ run_test() {
     RESULT=FAIL; live "== stopped: workflow(s) failed as written:$failed =="
     RESULT_MSG=$(printf 'These workflows failed when run exactly as written, in a fresh copy of the folder:%s\n%s' "$failed" "$runs")
     printf '# Workflow runs for %s\n\nCopy: %s\n%s\n' "$DIR" "$RUN" "$runs" > "$RESULT_FILE"
+    return
+  fi
+  if [ -n "$waiting" ]; then
+    RESULT=DECISION; live "== stopped: waiting on your decision:$waiting =="
+    RESULT_NOTE="Waiting on your decision. $(printf '%s' "$decision" | sed '/^$/d' | head -c 600)"
+    printf '# Waiting on your decision: %s\n\n%s\n\n## Runs\n%s\n' "$DIR" "$RESULT_NOTE" "$runs" > "$RESULT_FILE"
     return
   fi
   parts+=("ran ${#wfs[@]} workflow(s) in a copy")
@@ -687,6 +738,8 @@ run_test() {
   changes=$(collect_changes | head -c 60000)
   local history="" stream="$RUN/manager.jsonl"
   [ -s "$(ROUNDS)" ] && history=$(printf '\n\n%s\n\n--- EARLIER ROUNDS ---\n%s' "$HISTORY_PROMPT" "$(tail -c 16000 "$(ROUNDS)")")
+  [ -n "$history" ] && [ -f "$STATE/sentback-$KEY" ] && history=$(printf '%s\n\n--- CHANGED SINCE THE LAST ROUND ---\n%s' "$history" \
+    "$(changed_since_round | head -n 40)")
   live "-- manager (a fresh Claude) is testing$([ -n "$history" ] && echo ", with the record of earlier rounds"):"
   # A shell and edits only when contained; with ALLOW_UNCONTAINED=1 the manager just reads
   local tools="${TEST_TOOLS:-Read,Grep,Glob,Bash,Edit,Write}"
@@ -721,14 +774,16 @@ run_test() {
 
   live "== manager verdict: $verdict =="
   if [ "$verdict" = PASS ]; then
-    RESULT=PASS; parts+=("the manager found nothing")
+    local hard; hard=$(printf '%s\n' "$out" | hardening_count)
+    if [ "${hard:-0}" -gt 0 ]; then RESULT=PASS; parts+=("the manager found nothing blocking ($hard hardening item(s) for later, in the review)")
+    else RESULT=PASS; parts+=("the manager found nothing"); fi
     PASS_SUMMARY=$(printf '%s; ' "${parts[@]}"); PASS_SUMMARY=${PASS_SUMMARY%; }
     printf '# Workflow test of %s: PASS\n\n%s\n\n## Runs\n%s\n' "$DIR" "$out" "$runs" > "$RESULT_FILE"
     return
   fi
   RESULT=FAIL
-  RESULT_MSG=$(printf 'Your manager tried to refute or break your work, and found problems. Fix the real ones. If you are confident a finding is wrong, explain why in your reply instead of changing anything. Manager findings:\n%s' \
-    "$(printf '%s\n' "$out" | tail -c 6000)")
+  RESULT_MSG=$(printf 'Your manager tried to refute or break your work, and found problems. %s If you are confident a finding is wrong, explain why in your reply instead of changing anything. Manager findings:\n%s' \
+    "$FIX_ASK" "$(printf '%s\n' "$out" | tail -c 6000)")
   printf '# Workflow test of %s: FAIL\n\nCopy with the manager'"'"'s test inputs: %s\n\n%s\n\n## Runs\n%s\n' \
     "$DIR" "$SROOT/$(base_slug)-last-failed" "$out" "$runs" > "$RESULT_FILE"
 }
@@ -737,11 +792,11 @@ run_test() {
 save_note() {   # notes are for you: into the saved review and the log
   [ -n "$RESULT_NOTE" ] || return 0
   [ -f "$RESULT_FILE" ] && printf '\nNote: %s\n' "$RESULT_NOTE" >> "$RESULT_FILE"
-  [ "$RESULT" != ERROR ] && [ "$RESULT" != HIDDEN ] && log "manager note: $RESULT_NOTE"
+  case "$RESULT" in ERROR|HIDDEN|DECISION) ;; *) log "manager note: $RESULT_NOTE" ;; esac
   return 0
 }
 mark_passed() {   # the next test starts from the moment this snapshot was taken
-  clear_rounds; rm -f "$STATE/wfsent-$KEY"
+  clear_rounds; rm -f "$STATE/wfsent-$KEY" "$STATE/notified-$KEY"
   touch -r "$RUN/.started" "$STATE/review-$KEY.stamp"
   if [ -s "$RUN/.head" ]; then cp "$RUN/.head" "$STATE/review-$KEY.sha"; else rm -f "$STATE/review-$KEY.sha"; fi
   reset_tries review; reset_tries workflow
@@ -775,14 +830,26 @@ deliver_now() {   # returns 0 passed, 1 blocked, 2 handed to you
            set_status working; record_round "$RESULT_MSG"; await_reply
            block "$(printf 'agent-grid (manager, %s): %s' "$ROUND" "$RESULT_MSG")"; return 1 ;;
         *) log "manager: still flagged after ${REVIEW_MAX:-2} rounds, handed back to you. See ${RESULT_FILE/#$HOME/$TILDE}"
+           record_handed "$RESULT_MSG"
            set_status flagged
            notify "$name: manager flagged" "Problems remain after ${REVIEW_MAX:-2} rounds. Take a look."; return 2 ;;
       esac ;;
+    DECISION)
+      finish_run ""
+      log "manager: waiting on your decision, so it's handed to you (the analyst isn't sent back). $RESULT_NOTE"
+      set_status decision
+      notify_once "$name: needs your decision" "$RESULT_NOTE"; return 2 ;;
     *)
       finish_run keep
       log "manager: stopped, handed back to you. $RESULT_NOTE"
       set_status flagged
-      notify "$name: manager needs you" "$RESULT_NOTE Nothing was pushed."; return 2 ;;
+      # A broken checks.toml stays broken until you fix it: say so once, not at every handoff
+      case "$RESULT_NOTE" in
+        *"can't be used"*|*"can't be run"*|*"aren't valid JSON"*|*"can't be compared"*)
+          notify_once "$name: manager needs you" "$RESULT_NOTE Nothing was pushed." ;;
+        *) notify "$name: manager needs you" "$RESULT_NOTE Nothing was pushed." ;;
+      esac
+      return 2 ;;
   esac
 }
 
@@ -804,7 +871,11 @@ read_only_review() {   # folders where no code changed and there are no workflow
     log "manager: couldn't review, handed back to you: claude wasn't found"
     set_status flagged; notify "$name: manager needs you" "Claude wasn't found, so nothing was reviewed. Nothing was pushed."; return 2; }
   set_status reviewing
-  out=$(cd "$DIR" && printf '%s%s\n\n--- CHANGES ---\n%s\n' "$READ_PROMPT" "$(folder_rules)" "$changes" \
+  local history=""
+  [ -s "$(ROUNDS)" ] && history=$(printf '\n\n%s\n\n--- EARLIER ROUNDS ---\n%s' "$HISTORY_PROMPT" "$(tail -c 16000 "$(ROUNDS)")")
+  [ -n "$history" ] && [ -f "$STATE/sentback-$KEY" ] && history=$(printf '%s\n\n--- CHANGED SINCE THE LAST ROUND ---\n%s' "$history" \
+    "$(changed_since_round | head -n 40)")
+  out=$(cd "$DIR" && printf '%s%s%s\n\n--- CHANGES ---\n%s\n' "$READ_PROMPT" "$(folder_rules)" "$history" "$changes" \
         | AGENT_GRID_NESTED=1 AGENT_GRID_AUTOPUSH=0 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 timeout "$(cap "${REVIEW_TIMEOUT:-300}")" \
           "$cb" -p ${REVIEW_MODEL:+--model "$REVIEW_MODEL"} \
           --allowedTools "${REVIEW_TOOLS:-Read,Grep,Glob}" \
@@ -819,7 +890,10 @@ read_only_review() {   # folders where no code changed and there are no workflow
     set_status flagged; notify "$name: manager needs you" "$text Nothing was pushed."; return 2
   fi
   if [ "$verdict" = PASS ]; then
-    reset_tries review; log "manager: read-only review found no problems (no workflow, so nothing was run)"
+    n=$(printf '%s\n' "$out" | hardening_count)
+    reset_tries review; clear_rounds; rm -f "$STATE/notified-$KEY"
+    if [ "${n:-0}" -gt 0 ]; then log "manager: read-only review found nothing blocking ($n hardening item(s) for later; no workflow, so nothing was run). See ${RESULT_FILE/#$HOME/$TILDE}"
+    else log "manager: read-only review found no problems (no workflow, so nothing was run)"; fi
     touch "$STATE/review-$KEY.stamp"
     git -C "$DIR" rev-parse -q --verify HEAD > "$STATE/review-$KEY.sha" 2>/dev/null || rm -f "$STATE/review-$KEY.sha"
     return 0
@@ -827,13 +901,14 @@ read_only_review() {   # folders where no code changed and there are no workflow
   max="${REVIEW_MAX:-2}"; n=$(bump review)
   if [ "$n" -le "$max" ]; then
     log "manager: read-only review found problems (round $n of $max), sent back to the analyst. See ${RESULT_FILE/#$HOME/$TILDE}"
-    set_status working
-    block "$(printf 'agent-grid: your manager reviewed your work and tried to break it, and found problems (round %s of %s). Fix the real ones. If you are confident a finding is wrong, explain why in your reply instead of changing the code. Manager review:\n%s' \
-             "$n" "$max" "$(printf '%s\n' "$out" | tail -c 6000)")"
+    set_status working; record_round "$(printf '%s\n' "$out" | tail -c 6000)"; await_reply
+    block "$(printf 'agent-grid: your manager reviewed your work and tried to break it, and found problems (round %s of %s). %s If you are confident a finding is wrong, explain why in your reply instead of changing the code. Manager review:\n%s' \
+             "$n" "$max" "$FIX_ASK" "$(printf '%s\n' "$out" | tail -c 6000)")"
     return 1
   fi
   reset_tries review
   log "manager: still flagged after $max rounds, handed back to you. See ${RESULT_FILE/#$HOME/$TILDE}"
+  record_handed "$(printf '%s\n' "$out" | tail -c 6000)"
   set_status flagged
   notify "$name: manager flagged" "The manager still sees problems after $max rounds. Take a look."
   return 2
@@ -904,12 +979,29 @@ per_turn() { [ "${MANAGER_WHEN:-handoff}" = every-turn ]; }
 handed_off_now() { jget .last_assistant_message | grep -qiE '^[[:space:]*_>#`-]*handoff:'; }
 end_round() { rm -f "$(HANDOFF_FLAG)" "$STATE/sentback-$KEY"; }
 
+# Code and workflow files changed since a stamp ($2 = -quit stops at the first)
+changed_code() {   # $1 = stamp
+  find "$DIR" -type f -newer "$1" -not -path '*/.git/*' -not -path '*/node_modules/*' \
+       -not -path '*/__pycache__/*' -not -path '*/.scratch/*' \
+       \( -path "$WFDIR/*" -o -regextype posix-extended -regex ".*\.($CODE_ONLY|json|yaml|yml|ini|cfg|bat|ps1)$" \) \
+       -print ${2:+"$2"} 2>/dev/null
+}
 # After a send-back, did the analyst change any code or workflow, or only reply?
-code_changed_since() {   # $1 = stamp
-  [ -n "$(find "$DIR" -type f -newer "$1" -not -path '*/.git/*' -not -path '*/node_modules/*' \
-          -not -path '*/__pycache__/*' -not -path '*/.scratch/*' \
-          \( -path "$WFDIR/*" -o -regextype posix-extended -regex ".*\.($CODE_ONLY|json|yaml|yml|ini|cfg|bat|ps1)$" \) \
-          -print -quit 2>/dev/null)" ]
+code_changed_since() { [ -n "$(changed_code "$1" -quit)" ]; }
+changed_since_round() { changed_code "$STATE/sentback-$KEY" | sed "s|^$DIR/||"; }
+
+# How much context the session's latest reply carried. Past CONTEXT_WARN_K thousand tokens
+# the pane border says so: a long session is slower, and early decisions get buried.
+CTX_K=""
+show_context() {
+  local tp; tp=$(jget .transcript_path); [ -n "$pane" ] && [ -f "$tp" ] || return 0
+  CTX_K=$(tail -n 200 "$tp" | jq -r 'select(.type? == "assistant" and .message.usage != null) | .message.usage
+            | (.input_tokens // 0) + (.cache_read_input_tokens // 0) + (.cache_creation_input_tokens // 0)' 2>/dev/null \
+          | tail -n 1 | awk '{ printf "%d", $1 / 1000 }')
+  [ -n "$CTX_K" ] || return 0
+  tmux set -p -t "$pane" @ctx "$CTX_K" 2>/dev/null
+  if [ "$CTX_K" -ge "${CONTEXT_WARN_K:-200}" ]; then tmux set -p -t "$pane" @ctx_warn 1 2>/dev/null
+  else tmux set -pu -t "$pane" @ctx_warn 2>/dev/null; fi
 }
 
 finished_turn() {   # not tested: the analyst is still working
@@ -924,6 +1016,7 @@ finished_turn() {   # not tested: the analyst is still working
 handle_stop() {
   local rc; TESTED=0
   capture_reply
+  show_context
 
   # Sent back, and the analyst answered without changing any code: running the same test
   # again would give the same result, so it's yours now, with the analyst's reply
@@ -953,6 +1046,8 @@ handle_stop() {
   case $rc in 1) return ;; 2) end_round; return ;; esac     # or that the manager hasn't passed
   end_round
   finished_turn
+  [ "$TESTED" = 1 ] && [ -n "$CTX_K" ] && [ "$CTX_K" -ge "${CONTEXT_WARN_K:-200}" ] && \
+    log "manager note: passed. This session carries ${CTX_K}k tokens of context; a fresh one (/clear) will be faster for the next task, and NOTES.md carries over"
   # Push only what was tested: a hand edit during the test waits for the next one
   if [ "$TESTED" = 1 ] && changed_since "$STATE/started-$KEY"; then
     log "manager: not pushing; the folder changed while it was being tested, so the next test covers it"
@@ -961,7 +1056,8 @@ handle_stop() {
 
 BRIEFING_HANDOFF='agent-grid: you are an analyst agent with a manager. Work through the whole task at your own pace: the manager does not check each turn. When the task is finished (not after each step), hand off: make sure every process your code runs has an up-to-date workflow (below), if .agent-grid/checks.toml exists run each workflow'"'"'s run.sh and then agent-check from the folder root and fix anything that fails (the manager runs the same checks first, so a failure there costs a whole round), give a short summary of what you changed and anything you are unsure of, and end your reply with this line exactly:
 HANDOFF: ready for the manager
-The manager then runs every workflow in a copy of this folder, runs the user'"'"'s checks (.agent-grid/checks.toml), and tries to refute or break your work. Problems come back to you: fix them and finish again, or, if you are confident a finding is wrong, explain why without changing anything and it goes to the user. The user'"'"'s checks are read-only to you: agent-grid blocks edits to them.'
+The manager then runs every workflow in a copy of this folder, runs the user'"'"'s checks (.agent-grid/checks.toml), and tries to refute or break your work. Problems come back to you: fix them and finish again, or, if you are confident a finding is wrong, explain why without changing anything and it goes to the user. The user'"'"'s checks are read-only to you: agent-grid blocks edits to them.
+Keep NOTES.md in the folder current (decisions and their sources, open questions, where the work stands), so a fresh session can pick up where you left off. Read big data files with short scripts that print what you need, not into the conversation.'
 BRIEFING='agent-grid: you are an analyst agent with a manager. When you finish a turn that changed code, the manager runs every workflow in .agent-grid/workflows/ in a copy of this folder, runs the user'"'"'s checks (.agent-grid/checks.toml), and tries to refute or break your work. Problems come back to you. If there is no workflow for the code you change, your turn is sent back. The user'"'"'s checks are read-only to you: agent-grid blocks edits to them.'
 
 # ---- Before a tool runs: your files stay yours -------------------
@@ -984,6 +1080,30 @@ full_path_in_edit() {   # the text an Edit, Write, or MultiEdit adds names the f
   printf '%s' "$text" | grep -qiF -e "$DIR" && return 0
   command -v wslpath >/dev/null && e=$(wslpath -w "$DIR" 2>/dev/null) && [ -n "$e" ] && printf '%s' "$text" | grep -qiF -e "$e"
 }
+# Client data stays out of git: with COMMIT_BLOCK_PATTERN set (for example parcel numbers),
+# a git commit that would add matching text is blocked, and the analyst is told which files.
+# COMMIT_BLOCK_ALLOW exempts lines such as format examples.
+commit_guard() {   # $1 = command, $2 = folder it runs in
+  [ -n "${COMMIT_BLOCK_PATTERN:-}" ] || return 0
+  printf '%s' "$1" | grep -qE '(^|[;&|[:space:](])git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+commit([[:space:]]|$)' || return 0
+  local top files
+  top=$(git -C "$2" rev-parse --show-toplevel 2>/dev/null) || return 0
+  files=$(blocked_text_in "$top" | head -n 10 | paste -sd, - | sed 's/,/, /g')
+  [ -n "$files" ] || return 0
+  deny "this commit would put text matching the user's blocked pattern (client data such as parcel numbers) into git, in: $files. Keep client data out of git: move it to a data file that git ignores, or use made-up values in tests. If it is only a format example, tell the user, who can allow it with COMMIT_BLOCK_ALLOW."
+}
+blocked_text_in() {   # $1 = repo; files whose uncommitted or new text matches COMMIT_BLOCK_PATTERN
+  local f
+  { git -C "$1" diff HEAD --unified=0 2>/dev/null || git -C "$1" diff --cached --unified=0 2>/dev/null; } \
+    | awk '/^\+\+\+ /{ f = substr($0, 7); next } /^\+/{ print f "\t" substr($0, 2) }' \
+    | grep -E "$(printf '\t').*(${COMMIT_BLOCK_PATTERN})" | allowed_out | cut -f1 | sort -u
+  git -C "$1" ls-files -o --exclude-standard -z 2>/dev/null | while IFS= read -r -d '' f; do
+    [ "$(stat -c %s "$1/$f" 2>/dev/null || echo 0)" -lt 2000000 ] || continue
+    grep -hE "${COMMIT_BLOCK_PATTERN}" "$1/$f" 2>/dev/null | allowed_out | grep -q . && printf '%s\n' "$f"
+  done
+}
+allowed_out() { if [ -n "${COMMIT_BLOCK_ALLOW:-}" ]; then grep -vE "${COMMIT_BLOCK_ALLOW}"; else cat; fi; }
+
 pre_tool() {
   local tool p rel cmd cwd ins
   tool=$(jget .tool_name)
@@ -998,8 +1118,9 @@ pre_tool() {
   cwd=$(jget .cwd); cwd="${cwd:-$DIR}"
   # One regex for every protected path: .agent-grid/checks.toml, golden/, plugins' paths,
   # review.md, and whatever checks.toml lists under protect (your tests, specs)
-  # (a folder matches with or without its trailing slash, but not a longer name)
-  PROTECTED="($(protect_list | sed -e 's/[][\.*^$+?(){}|/]/\\&/g' -e 's/\\\/$/(\\\/|\\b)/' | paste -sd'|' -))"
+  # (a folder matches with or without its trailing slash, but not a longer name; "/" needs
+  # no escaping, and newer greps warn when it has one)
+  PROTECTED="($(protect_list | sed -e 's/[][\.*^$+?(){}|]/\\&/g' -e 's#/$#(/|\\b)#' | paste -sd'|' -))"
   case "$tool" in
     Edit|Write|MultiEdit|NotebookEdit)
       p=$(printf '%s' "$input" | jq -r '.tool_input.file_path // .tool_input.notebook_path // empty' 2>/dev/null)
@@ -1018,6 +1139,7 @@ pre_tool() {
       fi ;;
     Bash)
       cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)
+      commit_guard "$cmd" "$cwd"
       printf '%s' "$cmd" | grep -qiE "$PROTECTED" || return 0
       if printf '%s' "$cmd" | grep -qiE ">>?[[:space:]]*[\"']?[^[:space:]|;&]*${PROTECTED}|(^|[;&|[:space:](])(tee|rm|mv|truncate|chmod|unlink)[[:space:]][^|;&]*${PROTECTED}|sed[[:space:]][^|;&]*-i[^|;&]*${PROTECTED}|${PROTECTED}[^|;&]*(write_text|write_bytes|\.save\(|to_csv\(|to_excel\()|open\([^)]*${PROTECTED}[^)]*,[^)]*[\"'][wax]"; then
         deny "that command would change files that belong to the user (their checks, their own tests, known-good results, or review.md), which analysts can't change. Reading and running them is fine. If you believe one is wrong, stop and explain why in your reply."

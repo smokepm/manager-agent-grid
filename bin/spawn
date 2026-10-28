@@ -61,6 +61,10 @@
 #   --test [DIR]         run the manager's test on a folder now, in the foreground
 #   --watch [DIR]        follow the manager's test of a folder live, and each one after
 #                        it (Ctrl+b W does this for the pane you're in)
+#   --findings [DIR]     a folder's open findings: everything the manager found since its
+#                        last passing test, including findings handed to you
+#   --stats [DAYS]       per folder, the last DAYS days (default 7): handoffs, passes,
+#                        send-backs, times it came to you, median wait, and check coverage
 #   --clean              delete every test copy (they hold client data)
 #
 # Workspaces:
@@ -518,12 +522,81 @@ watch_review() {
     . as $line | (try (fromjson | if type == "object" then render else $line end) catch $line) | select(length > 0)'
 }
 
+# ---- Open findings -----------------------------------------------
+# A folder's findings stay on record until a test passes, including ones handed to you
+# after the last round, so each new test re-checks them. This shows that record.
+show_findings() {   # $1 = folder
+  local dir key f
+  dir=$(cd "${1:-.}" 2>/dev/null && pwd -P) || die "No such folder: $1"
+  key=$(printf '%s' "$dir" | md5sum | cut -c1-12); f="$STATE_DIR/rounds-$key.md"
+  if [ -s "$f" ]; then
+    printf '\033[1mOpen findings for %s\033[0m (re-checked at the next test, cleared when one passes)\n\n' "$(basename "$dir")"
+    cat "$f"
+  else
+    echo "No open findings for $(basename "$dir"): its last test passed, or none has failed yet."
+  fi
+}
+
+# ---- Stats -------------------------------------------------------
+# How the grid is doing, from the hook's log: per folder for the last N days (default 7),
+# and in total for the N days before, for comparison. Shows where checks are missing and
+# whether a change helped. "To you" counts each time work came to you instead of passing.
+stats() {   # $1 = days
+  local days="${1:-7}" log="$STATE_DIR/agent-hook.log" start prev kind f nh np nb ny w dir cfg cov key long
+  [[ "$days" =~ ^[1-9][0-9]*$ ]] || die "--stats takes a number of days, e.g. --stats 14"
+  [ -s "$log" ] || { echo "Nothing logged yet."; return 0; }
+  start=$(date -d "-$days days" '+%Y-%m-%d %H:%M:%S'); prev=$(date -d "-$((days * 2)) days" '+%Y-%m-%d %H:%M:%S')
+  printf '\033[1mManager activity, last %s days\033[0m (since %s; "Before" is the %s days until then)\n\n' "$days" "${start:0:10}" "$days"
+  printf '%-28s %8s %7s %9s %7s %8s   %s\n' Folder handoffs passed "sent back" "to you" "wait" "checks/golden/hidden"
+  # One record per event, and per wait (a handoff to its first result, in minutes)
+  awk -F '  ' -v s="$start" -v p="$prev" '
+    function mins(t,  y, m, d) {
+      y = substr(t, 1, 4) + 0; m = substr(t, 6, 2) + 0; d = substr(t, 9, 2) + 0
+      if (m <= 2) { y--; m += 12 }
+      return (365 * y + int(y / 4) - int(y / 100) + int(y / 400) + int((153 * (m - 3) + 2) / 5) + d) * 1440 \
+             + substr(t, 12, 2) * 60 + substr(t, 15, 2)
+    }
+    $1 < p || $3 !~ /^manager: / { next }
+    { w = ($1 >= s) ? "now" : "before"; f = $2; m = $3; k = "" }
+    m ~ /handed off; testing/ { k = "handoff" }
+    m ~ /^manager: (passed|read-only review found (no problems|nothing blocking))/ { k = "pass" }
+    m ~ /sent back to the analyst/ { k = "back" }
+    k == "" && m ~ /(handed (back )?to you|still flagged|replied without changing|waiting on your decision|stopped, handed|couldn.t (finish|review|copy|test)|didn.t test)/ { k = "you" }
+    k == "" { next }
+    { print "E\t" w "\t" f "\t" k }
+    k == "handoff" { t0[f] = mins($1); next }
+    f in t0 { d = mins($1) - t0[f]; print "W\t" w "\t" f "\t" d; print "W\t" w "\t~all\t" d; delete t0[f] }
+  ' "$log" | sort -t $'\t' -k1,1 -k2,2 -k3,3 -k4,4n | awk -F '\t' '
+    function med(w, f,  n) { n = wn[w, f]; return n ? wv[w, f, int((n + 1) / 2)] "m" : "-" }
+    function row(kind, label, w, f) {
+      printf "%s\t%s\t%d\t%d\t%d\t%d\t%s\n", kind, label, c[w, f, "handoff"], c[w, f, "pass"], c[w, f, "back"], c[w, f, "you"], med(w, f)
+    }
+    $1 == "E" { c[$2, $3, $4]++; c[$2, "~all", $4]++; if ($2 == "now") seen[$3] = 1; next }
+    $1 == "W" { n = ++wn[$2, $3]; wv[$2, $3, n] = $4 }
+    END { for (f in seen) row("F", f, "now", f); row("T", "Total", "now", "~all"); row("U", "Before", "before", "~all") }
+  ' | sort -t $'\t' -k1,1 -k2,2 | while IFS=$'\t' read -r kind f nh np nb ny w; do
+    if [ "$kind" != F ]; then
+      printf '\033[1m%-28s\033[0m %8s %7s %9s %7s %8s\n' "$f" "$nh" "$np" "$nb" "$ny" "$w"; continue
+    fi
+    dir="${f/#$TILDE/$HOME}"; cfg="$dir/.agent-grid/checks.toml"
+    if [ -f "$cfg" ]; then cov="$(grep -c '^\[\[check\]\]' "$cfg")/$(grep -c '^\[\[golden\]\]' "$cfg")"; else cov="-/-"; fi
+    key=$(cd "$dir" 2>/dev/null && pwd -P | tr -d '\n' | md5sum | cut -c1-12)
+    cov="$cov/$(find "$CONF_DIR/hidden/$key" -maxdepth 1 -name '*.sh' 2>/dev/null | wc -l)"
+    printf '%-28s %8s %7s %9s %7s %8s   %s\n' "$(basename "$dir" | cut -c1-28)" "$nh" "$np" "$nb" "$ny" "$w" "$cov"
+  done
+  # Long sessions are slow: name the panes past the warning line
+  long=$(tmux list-panes -a -f '#{@ctx_warn}' -F '#{?@label,#{@label},#{b:pane_current_path}} (#{@ctx}k)' 2>/dev/null | paste -sd, - | sed 's/,/, /g')
+  [ -n "$long" ] && printf '\nSessions carrying a lot of context (start fresh with /clear): %s\n' "$long"
+  return 0
+}
+
 # ---- Status, overview, and messaging ------------------------------
 status_text() {
   case "$1" in
     setup)    echo "setting up checks" ;;
     setup-ready) echo "CHECKS READY: YOUR TURN" ;;
     waiting)  echo "NEEDS YOU" ;;
+    decision) echo "NEEDS YOUR DECISION" ;;
     failed)   echo "CHECKS FAILED" ;;
     flagged)  echo "MANAGER FLAGGED" ;;
     checking) echo "checking" ;;
@@ -535,7 +608,7 @@ status_text() {
   esac
 }
 status_rank() {
-  case "$1" in waiting|setup-ready) echo 1 ;; failed|flagged) echo 2 ;; done) echo 3 ;; checking|reviewing|queued) echo 4 ;; working|setup) echo 5 ;; *) echo 6 ;; esac
+  case "$1" in waiting|setup-ready|decision) echo 1 ;; failed|flagged) echo 2 ;; done) echo 3 ;; checking|reviewing|queued) echo 4 ;; working|setup) echo 5 ;; *) echo 6 ;; esac
 }
 
 # One line per agent pane: pane_id <tab> display text, most urgent first
@@ -552,7 +625,7 @@ agent_lines() {
 summary() {
   local w=0 f=0 d=0 r=0 m=0 s out=""
   while read -r s; do
-    case "$s" in waiting|setup-ready) w=$((w + 1)) ;; failed|flagged) f=$((f + 1)) ;; done) d=$((d + 1)) ;;
+    case "$s" in waiting|setup-ready|decision) w=$((w + 1)) ;; failed|flagged) f=$((f + 1)) ;; done) d=$((d + 1)) ;;
                  working|checking|setup) r=$((r + 1)) ;; reviewing|queued) m=$((m + 1)) ;; esac
   done < <(tmux list-panes -a -f '#{@agent}' -F '#{@status}' 2>/dev/null)
   [ $w -gt 0 ] && out+="$w need you  "
@@ -721,6 +794,10 @@ for ((i = 0; i < ${#argv[@]}; i++)); do
     --prompt-file) i=$((i + 1)); PROMPT_FILE="${argv[$i]:-}"; [ -n "$PROMPT_FILE" ] || die "--prompt-file needs a file name" ;;
     --overview)  overview; exit $? ;;
     --summary)   summary; exit 0 ;;
+    --findings)  nxt="${argv[$((i + 1))]:-.}"; [[ "$nxt" == -* ]] && nxt=.
+                 show_findings "$nxt"; exit $? ;;
+    --stats)     nxt="${argv[$((i + 1))]:-}"; [[ "$nxt" == -* ]] && nxt=""
+                 stats "$nxt"; exit $? ;;
     --all)       SEND_ALL=1 ;;
     --send)      SEND=1
                  nxt="${argv[$((i + 1))]:-}"

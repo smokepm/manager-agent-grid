@@ -92,6 +92,8 @@ The first `spawn --gh` walks you through `gh auth login` if you haven't done it.
 | `spawn --overview` | All agents, most urgent first, with a live preview; Enter jumps there |
 | `spawn --test [DIR]` | Run the manager's test on a folder now |
 | `spawn --watch [DIR]` | Follow the manager's reviews of a folder live |
+| `spawn --findings [DIR]` | A folder's open findings: everything found since its last passing test, including findings handed to you |
+| `spawn --stats [DAYS]` | Per folder, the last 7 days (or DAYS): handoffs, passes, send-backs, times it came to you, median wait, check coverage |
 | `spawn --setup [DIR]` | Have Claude set up a folder's checks, with a summary for you to confirm |
 | `spawn --hidden [DIR]` | Your hidden checks for a folder, kept outside it |
 | `agent-check init` | Start a folder's `checks.toml` by hand |
@@ -162,6 +164,8 @@ Every agent pane reports what it's doing on its border:
 | **[manager testing]** | The manager is testing this agent's last change; the agent waits for the verdict |
 | **[manager queued for Excel]** | Waiting for another folder's Excel test to finish |
 | **[needs you]** | Claude is waiting for permission or input |
+| **[needs your decision]** | A workflow stopped on purpose (exit 3) until you decide something, such as which of two sources is right. The analyst isn't sent back for it |
+| **[context 250k: /clear before the next task]** | The session's latest reply carried more than `CONTEXT_WARN_K` thousand tokens. A fresh session is faster and keeps early decisions from getting buried; the analyst's `NOTES.md` carries over |
 | **[done]** | Finished its turn |
 | **[checks failed]** | Verification still failed after `VERIFY_MAX` tries, handed back to you |
 | **[manager flagged]** | Handed back to you: the manager still sees problems after `REVIEW_MAX` rounds, the analyst stopped without writing a workflow it was asked for, your hidden checks failed, or the manager couldn't test safely |
@@ -300,7 +304,7 @@ To test every turn that changed something instead, the way agent-grid used to, s
    Problems go back to the analyst.
 3. **Snapshot.** The folder is copied as it is right now. Folders on a Windows drive under WSL get their copy on the Windows side, so `winpy` and Excel can open the files.
 4. **The analyst waits.** The pane shows **[manager testing]** until the verdict. Your other analysts keep working.
-5. **Baseline.** Each `run.sh` runs once, exactly as written. Outputs your checks read (your `outputs` list, each golden test's expected outputs, and any a plugin names) are removed first, so a workflow that stops writing one can't pass on a stale copy. A failure goes straight back with the error.
+5. **Baseline.** Each `run.sh` runs once, exactly as written. Outputs your checks read (your `outputs` list, each golden test's expected outputs, and any a plugin names) are removed first, so a workflow that stops writing one can't pass on a stale copy. A failure goes straight back with the error. A workflow that exits 3 has stopped on purpose until you decide something (analysts are told to do this when sources disagree or an amount is over its maximum): the test stops there, the pane shows **[needs your decision]** with what it printed, and the analyst isn't sent back. You're notified once, not at every handoff, until it's resolved.
 6. **Your checks.** Your check commands on this run's outputs, then each golden test in its own copy, and any checks a domain pack adds. If any fails, it goes straight back to the analyst with what failed, without spending a manager review. If `checks.toml` itself is unusable (a missing file, a renamed column), it comes to you instead.
 7. **Your hidden checks**, if you've written any with `spawn --hidden`. A failure comes to you; the analyst isn't told.
 8. **Refute or break it.** The manager, a second Claude, works in the copy with full tools:
@@ -309,7 +313,9 @@ To test every turn that changed something instead, the way agent-grid used to, s
    - feeds in altered inputs (duplicates, blanks, zero and negative amounts, values at and over limits, missing columns) and runs `agent-check` on the results, so your checks judge its attacks too;
    - reruns to confirm the results don't change, and reads the changed code for wrong rules.
 9. **Verdict.**
-   - Each round's findings and the analyst's reply to them are kept as a record. The next review gets that record and is told to verify each earlier finding is really fixed, and to raise a disputed one again only with new evidence that answers the analyst's argument. A pass clears the record.
+   - **Graded findings** (`MANAGER_GRADING=1`, the default). Each problem is **BLOCKING** or **HARDENING**. BLOCKING means a wrong result on the real inputs, a broken rule from your instructions (a tie-out claimed but never checked, silently choosing between sources that disagree, an amount over a stated maximum), or a wrong result on realistic bad input. Everything else is HARDENING: unlikely made-up inputs, a crash where nothing wrong is written, stale docs. Only BLOCKING problems fail the test. HARDENING ones are listed in the saved review and counted in the pass line ("2 hardening item(s) for later"), without costing the analyst another round. `MANAGER_GRADING=0` fails on any problem.
+   - Each round's findings and the analyst's reply to them are kept as a record, **including findings handed to you after the last round**. The next review gets that record and is told to verify each earlier finding is really fixed, and to raise a disputed one again only with new evidence that answers the analyst's argument. A pass clears the record. `spawn --findings` shows it.
+   - **Later rounds converge.** After re-checking earlier findings, the manager looks for new problems mainly in what changed since the last round (it's given the list). A new problem in unchanged code counts as BLOCKING only if it's a wrong result on the real inputs or a broken rule.
    - Problems go straight back to the analyst, which picks up where it left off.
    - After `REVIEW_MAX` rounds (default 2), the pane shows **[manager flagged]** and you're notified.
    - A test that can't finish, from a timeout for example, is also flagged, never passed.
@@ -320,9 +326,9 @@ A change to your checks or protected files triggers a new test even if no code c
 
 #### Containment
 
-Each test runs inside [bubblewrap](https://github.com/containers/bubblewrap), because it runs the analyst's code and gives the manager a shell. The test copy and `/tmp` are writable, and so is your home directory, because Claude keeps its session files there, with these exceptions:
+Each test runs inside [bubblewrap](https://github.com/containers/bubblewrap), because it runs the analyst's code and gives the manager a shell. The test copy is writable, `/tmp` is the test's own (nothing written there is left behind or seen outside), and your home directory is writable because Claude keeps its session files there, with these exceptions:
 
-- **Read-only:** agent-grid itself, `~/.config/agent-grid` (your settings, hidden checks, domain packs, and plugins), each plugin's own folder, `~/.local/bin`, Claude's `settings.json` and `CLAUDE.md`, and your shell and git config. So nothing a test runs can rewrite your checks, the tools that run them, or the hooks that enforce them.
+- **Read-only:** agent-grid itself, `~/.config/agent-grid` (your settings, hidden checks, domain packs, and plugins), each plugin's own folder, `~/.local/bin`, Claude's `settings.json`, `CLAUDE.md`, commands, skills and agents, `~/.venv` (the Python every real run uses, so a test can't install or upgrade packages in it), and your shell and git config. So nothing a test runs can rewrite your checks, the tools that run them, the hooks that enforce them, or the environment your real runs depend on.
 - **Hidden:** `~/.ssh`, `~/.config/gh`, `~/.aws`, and `~/.gnupg`. A test never needs your credentials.
 
 Everything else is read-only: the real folder, every folder beside it, and every Windows drive. So a script that writes to `S:\` by mistake fails instead of writing. `spawn --doctor` confirms it works.
@@ -342,6 +348,8 @@ Test copies and saved reviews contain your project's data (which may be sensitiv
 - **Saved reviews** are deleted after `REVIEW_KEEP_DAYS` (default 30).
 
 Copies are private to your user. `spawn --clean` deletes every copy now.
+
+**Keeping client data out of git.** Set `COMMIT_BLOCK_PATTERN` to a regular expression for data that must never be committed, for example parcel numbers: `COMMIT_BLOCK_PATTERN='\b[0-9]{3}-[0-9]{3}-[0-9]{2,3}\b'`. In managed sessions, an analyst's `git commit` that would add matching text (in changed or new files) is blocked, and the analyst is told which files and why. `auto-commit` skips the commit the same way. `COMMIT_BLOCK_ALLOW` exempts lines such as made-up examples (`'999-999-'`).
 
 #### Watching a review
 
@@ -421,6 +429,10 @@ Settings live in `~/.config/agent-grid/config`; workspaces in `~/.config/agent-g
 | `REVIEW_DEFAULT` | `1` (default) launches the manager with every spawn, `0` makes it opt-in |
 | `MANAGER_WHEN` | `handoff` (default): the manager tests once the analyst hands off its finished work. `every-turn`: it tests every turn that changed something |
 | `REVIEW_MAX` | Rounds the manager's findings go back to the analyst (default 2) |
+| `MANAGER_GRADING` | `1` (default): only BLOCKING findings fail a test; HARDENING ones are listed for later. `0`: any finding fails it |
+| `CONTEXT_WARN_K` | Thousands of tokens of session context past which the pane border suggests `/clear` (default 200) |
+| `COMMIT_BLOCK_PATTERN` | Regular expression for client data that must not be committed, e.g. parcel numbers (default: none) |
+| `COMMIT_BLOCK_ALLOW` | Lines matching this are exempt from `COMMIT_BLOCK_PATTERN`, e.g. made-up examples (default: none) |
 | `REVIEW_TIMEOUT` | Seconds a read-only review may take (default 300) |
 | `REVIEW_MODEL` | Model for the manager (blank = your default) |
 | `REVIEW_TOOLS` | Tools for read-only reviews (default `Read,Grep,Glob`) |

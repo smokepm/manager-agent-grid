@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.20.0 (2026-10-28)
+
+From a review of a month of manager results: 85% of findings were real, but only 14% changed the real numbers. Most interruptions came from loops the grid itself could stop, and findings handed to you after the last round were dropped.
+
+- **Graded findings.** The manager grades each problem BLOCKING (a wrong result on the real inputs, a broken rule from your instructions, or a wrong result on realistic bad input) or HARDENING (anything else). Only BLOCKING problems fail a test. HARDENING ones stay in the review and the pass line counts them. `MANAGER_GRADING=0` restores fail-on-anything.
+- **Nothing gets lost.** Findings handed to you after the last round now stay on the record, so the next test re-checks them. `spawn --findings [DIR]` shows a folder's open findings. The read-only review for big folders keeps the same record.
+- **Rounds converge.** Later rounds re-check earlier findings and look for new problems mainly in what changed since the last round, which they're given as a list.
+- **Waiting on your decision.** A workflow that exits 3 has stopped on purpose until you decide something. The test stops there, the pane shows **[needs your decision]**, the analyst isn't sent back, and you're notified once rather than at every handoff. Analysts are told about exit 3 in the workflow instructions.
+- **One notice for a broken checks.toml.** An unusable `checks.toml` or plugin notifies you once, not at every handoff, until a test passes.
+- **`spawn --stats [DAYS]`:** per folder, handoffs, passes, send-backs, times it came to you, median wait, and check coverage (checks, golden tests, hidden checks), with the period before for comparison.
+- **Session context in the border.** When a session's latest reply carries more than `CONTEXT_WARN_K` thousand tokens (default 200), its pane says so, and a pass logs a reminder to start fresh. Analysts are told to keep `NOTES.md` current so a fresh session can pick up.
+- **Client data stays out of git.** With `COMMIT_BLOCK_PATTERN` set (for example parcel numbers), an analyst's `git commit` that would add matching text is blocked with the file names, and `auto-commit` skips it. `COMMIT_BLOCK_ALLOW` exempts made-up examples.
+- **A tighter sandbox.** Tests get their own `/tmp`. `~/.venv` and Claude's commands, skills and agents are read-only during tests.
+- Fixed: the protected-file check made newer versions of grep print "stray \\" warnings, which showed up in analysts' block messages.
+
 ## 0.19.0 (2026-10-28)
 
 - **A review that doesn't finish isn't a pass.** When a folder is too big to copy, the manager reviews the changes read-only. If that review ran out of time, gave no verdict, or couldn't start, the work counted as passed and was pushed. Now it comes to you (**[manager flagged]** and a notification), and nothing is pushed.

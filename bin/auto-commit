@@ -36,6 +36,15 @@ git add -u
 # only the analyst's workflows there are code
 git ls-files -o --exclude-standard | grep -E "\.($EXT)$" | awk '!/^\.agent-grid\// || /^\.agent-grid\/workflows\//' \
   | xargs -r -d '\n' git add --
+# Client data stays out of git: with COMMIT_BLOCK_PATTERN set (e.g. parcel numbers), nothing
+# is committed while the staged text matches it (COMMIT_BLOCK_ALLOW exempts format examples)
+if [ -n "${COMMIT_BLOCK_PATTERN:-}" ]; then
+  bad=$(git diff --cached --unified=0 | awk '/^\+\+\+ /{ f = substr($0, 7); next } /^\+/{ print f "\t" substr($0, 2) }' \
+        | grep -E "$(printf '\t').*(${COMMIT_BLOCK_PATTERN})" \
+        | { if [ -n "${COMMIT_BLOCK_ALLOW:-}" ]; then grep -vE "$COMMIT_BLOCK_ALLOW"; else cat; fi; } \
+        | cut -f1 | sort -u | head -n 5 | paste -sd, -)
+  if [ -n "$bad" ]; then log "not committing: text matching COMMIT_BLOCK_PATTERN in $bad"; exit 0; fi
+fi
 
 committed=0
 if ! git diff --cached --quiet; then
